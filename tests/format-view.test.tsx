@@ -1255,13 +1255,23 @@ test('a truncated stdout is cli-output', async ($, on) => {
 
 // -- pause ---------------------------------------------------------------------------------------------
 
+for (const [name, source] of [['a key source', 'ANTHROPIC_API_KEY'], ['an unreadable key source', 5]] as const) {
+  test(`a billing mismatch under subscription billing is api spend when the run reports ${name}`, async ($, on) => {
+    const b = await boot($, on, { 'opt:format': true, 'opt:format-billing': 'subscription' })
+    b.w.replies.set(options.source, { stdout: cli.stream({ ...cli.init('none'), apiKeySource: source }, cli.resultOk(options.output, { total_cost_usd: 0.0061 })) })
+    await orchestrate($)
+    await finish($, b, options.source)
+    expect(await noteOf($)).toBe('formatted 0 · as written 1 · last: billing-mismatch (short/opus) · api $0.01 · paused: billing-mismatch')
+  })
+}
+
 test('a billing mismatch pauses formatting for the session; /clear lifts it', async ($, on) => {
   const b = await boot($, on)
-  // An api run whose init says "none": a key-less run that fell back to something else.
+  // An api run whose init says "none": a key-less run that fell back to something else. No key paid, so the spend is plan use.
   b.w.replies.set(options.source, { stdout: cli.stream(cli.init('none'), cli.resultOk(options.output, { total_cost_usd: 0.0061 })) })
   await orchestrate($)
   await finish($, b, options.source)
-  expect(await noteOf($)).toBe('formatted 0 · as written 1 · last: billing-mismatch (short/opus) · api $0.01 · paused: billing-mismatch')
+  expect(await noteOf($)).toBe('formatted 0 · as written 1 · last: billing-mismatch (short/opus) · plan $0.01 · paused: billing-mismatch')
   b.w.replies.set(done.source, done.output)
   await finish($, b, done.source)
   await finish($, b, done.source)

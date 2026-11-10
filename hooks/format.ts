@@ -420,7 +420,10 @@ export function verifyRun(stdout: string, expect: { billing: Billing; model: str
 
     const wanted = expect.billing === 'api' ? 'ANTHROPIC_API_KEY' : expect.billing === 'subscription' ? 'none' : null
     const source = inits[0]?.apiKeySource
-    if (typeof source !== 'string' || wanted === null || source !== wanted) return { ok: false, reason: 'billing-mismatch', costUsd }
+    if (typeof source !== 'string' || wanted === null || source !== wanted) {
+      // The run is over, so the report says who paid: no key source means the plan, anything else (an unreadable value too) counts as a key, so money is never shown as plan use.
+      return { ok: false, reason: 'billing-mismatch', costUsd, paidBy: source === 'none' ? 'subscription' : 'api' }
+    }
 
     const usage = isObject(result.usage) ? result.usage : {}
     const outputTokens = Math.max(0, num(usage.output_tokens) ?? 0)
@@ -456,7 +459,7 @@ export function verifyRun(stdout: string, expect: { billing: Billing; model: str
 
 export type FormatResult =
   | { ok: true; parts: Part[]; costUsd: number; durationMs: number }
-  | { ok: false; reason: Reason | CallReason; costUsd: number }
+  | { ok: false; reason: Reason | CallReason; costUsd: number; paidBy?: Billing }
 
 // One call, one validation. `call` runs the child (step 9). A call that fails, or throws, ends the
 // attempt; the message of a throw is not kept.
@@ -473,7 +476,7 @@ export async function formatOnce(
   }
   if (!isObject(out)) return { ok: false, reason: 'cli-failed', costUsd: 0 }
   const costUsd = money(out.costUsd)
-  if (out.ok !== true) return { ok: false, reason: out.reason, costUsd }
+  if (out.ok !== true) return out.paidBy === 'api' || out.paidBy === 'subscription' ? { ok: false, reason: out.reason, costUsd, paidBy: out.paidBy } : { ok: false, reason: out.reason, costUsd }
   const v = validate(source, out.text)
   return v.ok ? { ok: true, parts: v.parts, costUsd, durationMs: out.durationMs } : { ok: false, reason: v.reason, costUsd }
 }
