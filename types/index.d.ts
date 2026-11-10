@@ -100,6 +100,8 @@ declare module 'claude-code' {
       // conversions claimed and not yet ended; the animation timer runs while any is, or while a turn runs
       fmtPendingN: number
       fmtTicking: boolean
+      // counts the changes to the originals of hidden replies (module state), so a row that read it draws again
+      fmtHeld: number
     }
   }
 }

@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { Engine, MockClock } from 'claude-code/testing'
 
-import { FORMAT_SYSTEM, KINDS, LIMITS, MARK } from '../hooks/format'
+import { FORMAT_SYSTEM, KINDS, LIMITS, MARK, TAG_EDGE, TAG_ONE, TAG_ZERO, stripTag, tagOf, untag } from '../hooks/format'
 import { FMT_MAX_BYTES, FMT_MAX_ENTRIES, FORMAT_TOOL, FORMAT_TOOL_FULL, FRAMES, PILL_LEFT, PILL_RIGHT } from '../hooks/format-view'
 import * as cli from './fixtures/format/cli'
 import * as done from './fixtures/format/done'
@@ -44,6 +44,8 @@ type World = {
   descriptions: string[]
   // every store call as `op:key` (keys has none), and a switch that makes the writes under `fmt:` fail
   storeOps: string[]; denyFmtWrites: boolean; denyFmtReads: boolean
+  // the stream hook's neighbours: a state read held until a gate opens, and a delay of the final flush beneath the plugin
+  gate: { key: string; until: Promise<void> } | null; finalDelay: number
 }
 
 const CLAUDE_BIN = 'claude'
@@ -59,7 +61,7 @@ async function boot($: Engine, on: On, seed: Record<string, unknown> = { 'opt:fo
   const mc = mock.clock(on, { now: Date.parse('2026-11-10T10:00Z') })
   const w: World = {
     calls: [], tools: [], commands: [], opened: [], store: new Map(Object.entries({ 'opt:format-trigger': 'auto', ...seed })), replies: new Map(), delays: new Map(),
-    env: { ...envVars }, envAsked: [], files: new Map(), stats: [], reads: [], written: [], runs: [], logs: [], cost: 0.0061, lsExit: 0, aclExit: 0, truncated: false, advancing: 0, periods: 0, engineRows: [], descriptions: [], storeOps: [], denyFmtWrites: false, denyFmtReads: false,
+    env: { ...envVars }, envAsked: [], files: new Map(), stats: [], reads: [], written: [], runs: [], logs: [], cost: 0.0061, lsExit: 0, aclExit: 0, truncated: false, advancing: 0, periods: 0, engineRows: [], descriptions: [], storeOps: [], denyFmtWrites: false, denyFmtReads: false, gate: null, finalDelay: 0,
   }
   // A fake run that lasts N ms moves the clock N ms from inside its hook. The animation timer ticks every 100 ms on the
   // way, and the mock clock resolves them one at a time as the test's own calls come, so settle and advance go on until such a run is over.
@@ -176,6 +178,15 @@ async function boot($: Engine, on: On, seed: Record<string, unknown> = { 'opt:fo
     return ran(cli.resultOk('', used))
   })
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  // nothing beneath the plugin answers a flush; a delay here is a hook of the settings that takes its time
+  on('classic.MessageDisplay', async (_, e) => {
+    if (w.finalDelay > 0 && e.final) await clock.sleep(w.finalDelay)
+    return {}
+  })
+  on('state.get', async (_, e, next) => {
+    if (w.gate && w.gate.key === e.key) await w.gate.until
+    return next(e)
+  })
   on('turn.complete', () => ({ text: '' }))
   on('skill.prompt', (_, e) => ({ text: e.text }))
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
@@ -2292,4 +2303,349 @@ test('a store that cannot be read leaves the replies as written and the option s
   await b.clock.settle()
   expect(await isOriginal(ui)).toBe(false)
   await ui.unmount()
+})
+
+// -- hiding a marked reply while it streams (D9-D11) ---------------------------------------------------------------
+// The terminal draws streaming text without the render hook; `classic.MessageDisplay` is the one place the text can be
+// held back. A marked reply gets one placeholder line plus an invisible tag, every other flush passes through, and the
+// committed row (whose text is the concatenation of what the flushes returned) finds its original by the tag.
+
+type Flush = { id: string; index: number; final: boolean; delta: string; agent?: string }
+const flushOf = ($: Engine, f: Flush) =>
+  $.classic.MessageDisplay({ turn_id: 'tt', message_id: f.id, index: f.index, final: f.final, delta: f.delta, ...(f.agent ? { agent_id: f.agent } : {}) } as never) as Promise<{ displayContent?: string }>
+// A reply as the engine streams it: batches of whole lines, the last one final. The row is what the engine commits:
+// the model's delta where the hook left it, else what the hook returned.
+function flushesOf(id: string, text: string, per = 3): Flush[] {
+  const lines = text.split('\n')
+  const out: Flush[] = []
+  for (let i = 0; i < lines.length; i += per) {
+    const rest = lines.slice(i, i + per)
+    const last = i + per >= lines.length
+    out.push({ id, index: out.length, final: last, delta: rest.join('\n') + (last ? '' : '\n') })
+  }
+  return out
+}
+async function streamReply($: Engine, id: string, text: string, per = 3) {
+  const flushes = flushesOf(id, text, per)
+  const results: { displayContent?: string }[] = []
+  for (const f of flushes) results.push(await flushOf($, f))
+  const row = results.map((r, i) => r.displayContent ?? flushes[i]!.delta).join('')
+  return { flushes, results, row }
+}
+const bare = (s: string) => s.replace(/[\u200b\u200c\u2060]/g, '')
+const STREAM_PLACEHOLDER = `${FRAMES[0]} formatting reply`
+const REPLY = first(options.source)
+
+const untouched = (r: { displayContent?: string }) => 'displayContent' in r
+
+test('unmarked replies, a last-line marker, a subagent and a raw session: every flush passes through untouched', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  await orchestrate($)
+  const cases: [string, string][] = [
+    ['an unmarked reply', options.source],
+    ['a marker on the last line', marked(options.source)],
+    ['a marker that is not alone on its line', `${MARK} ${options.source}`],
+    ['a marker after the first line', `Intro\n${REPLY}`],
+  ]
+  for (const [name, text] of cases) {
+    const { results, row } = await streamReply($, `u-${name}`, text)
+    for (const r of results) expect([name, untouched(r)]).toEqual([name, false])
+    expect([name, row]).toEqual([name, text])
+  }
+  // a subagent's marked reply is not redrawn
+  for (const f of flushesOf('u-sub', REPLY).map(f => ({ ...f, agent: 'sub-1' }))) expect(untouched(await flushOf($, f))).toBe(false)
+  // raw for the session: as written
+  await callTool($, { format: 'raw', scope: 'session' })
+  for (const r of (await streamReply($, 'u-raw', REPLY)).results) expect(untouched(r)).toBe(false)
+  expect(rowsOf(b)).toEqual([])
+})
+
+test('a normal session (the skill never loaded) and the option off never hide a marked reply', async ($, on) => {
+  await boot($, on, MARKED_MODE)
+  const one = await streamReply($, 'n-1', REPLY)
+  for (const r of one.results) expect(untouched(r)).toBe(false)
+  expect(one.row).toBe(REPLY)
+})
+
+test('with the option off, the skill loaded, a marked reply is not hidden', async ($, on) => {
+  const off = await boot($, on, {})
+  await orchestrate($)
+  const two = await streamReply($, 'n-2', REPLY)
+  for (const r of two.results) expect(untouched(r)).toBe(false)
+  expect(two.row).toBe(REPLY)
+  expect(off.w.calls).toEqual([])
+})
+
+test('a paused session does not hide a marked reply', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, { stdout: cli.stream(cli.init('none'), cli.resultOk(options.output, { total_cost_usd: 0.0061 })) })
+  await orchestrate($)
+  await finish($, b, REPLY)
+  expect(await noteOf($)).toContain('paused: billing-mismatch')
+  const paused = await streamReply($, 'p-1', REPLY)
+  for (const r of paused.results) expect(untouched(r)).toBe(false)
+  // /clear lifts the pause and the skill loads again: hidden once more
+  await $.session.end({ reason: 'clear', sessionId: 's1' } as never)
+  await orchestrate($)
+  const again = await streamReply($, 'p-2', REPLY)
+  expect(again.results[0]?.displayContent).toContain(STREAM_PLACEHOLDER)
+})
+
+test('a marked reply streams as one placeholder line plus an invisible tag, and none of the model\'s text', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  await orchestrate($)
+  await startTurn($, b)
+  const body = Array.from({ length: 12 }, (_, i) => `Line ${i} of the schema migration plan.`).join('\n')
+  const { flushes, results, row } = await streamReply($, 'm-1', `${MARK}\n\n${body}`, 1)
+  expect(flushes.length).toBeGreaterThan(7)
+  // flush 0: the placeholder and the tag; then a dot per flush for the first five; then nothing; the final flush adds nothing
+  const tag = untag(results[0]!.displayContent!)!
+  expect(results[0]!.displayContent).toBe(STREAM_PLACEHOLDER + tagOf(tag))
+  expect(results.slice(1).map(r => r.displayContent)).toEqual(flushes.slice(1).map((f, i) => (!f.final && i + 1 <= 5 ? ' .' : '')))
+  // nothing of the model's text, and the tag is invisible text only
+  for (const [i, r] of results.entries()) {
+    const out = r.displayContent ?? ''
+    expect([i, out.includes(MARK)]).toEqual([i, false])
+    for (const word of ['migration', 'schema', 'Line']) expect([i, bare(out).includes(word)]).toEqual([i, false])
+  }
+  expect(row.includes('migration')).toBe(false)
+  expect(bare(row)).toBe(`${STREAM_PLACEHOLDER} . . . . .`)
+  const invisible = [...row].filter(c => bare(c) === '')
+  expect(invisible).toHaveLength(34)
+  expect(invisible.every(c => [TAG_ZERO, TAG_ONE, TAG_EDGE].includes(c))).toBe(true)
+  // the tag is in the committed row exactly once, and the id is not the message id itself
+  expect(untag(row)).toBe(tag)
+  expect(stripTag(row)).toBe(bare(row))
+  expect(tag).toMatch(/^[0-9a-f]{8}$/)
+})
+
+test('a one-flush marked reply, and several text blocks of one turn, each get their own tag', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  await orchestrate($)
+  await startTurn($, b)
+  const single = await flushOf($, { id: 's-1', index: 0, final: true, delta: REPLY })
+  expect(single.displayContent).toMatch(new RegExp(`^${STREAM_PLACEHOLDER}[\\u200b\\u200c\\u2060]{34}$`))
+  const other = await streamReply($, 's-2', `${MARK}\nSecond block of the turn`)
+  const a = untag(single.displayContent!)
+  const c = untag(other.row)
+  expect(a).not.toBeNull()
+  expect(c).not.toBeNull()
+  expect(a).not.toBe(c)
+  // each row finds its own original
+  const rowA = await show($, single.displayContent!)
+  const rowC = await show($, other.row)
+  expect(await texts(rowA)).toEqual([spin(0, 0)])
+  expect(await texts(rowC)).toEqual([spin(0, 0)])
+  await rowA.unmount()
+  await rowC.unmount()
+})
+
+test('flushes of one message never decide before flush 0: they wait for it, whichever ends first', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  await orchestrate($)
+  // the read flush 0 makes first is held until the gate opens
+  let open!: () => void
+  b.w.gate = { key: 'fmtOrch', until: new Promise<void>(resolve => { open = resolve }) }
+  const flushes = flushesOf('c-1', REPLY, 4)
+  const settled: number[] = []
+  const pending = flushes.map((f, i) => flushOf($, f).then(r => (settled.push(i), r)))
+  await b.clock.settle()
+  // flush 0 is held at its decision, so no later flush has answered
+  expect(settled).toEqual([])
+  b.w.gate = null
+  open()
+  const results = await Promise.all(pending)
+  expect(results[0]!.displayContent).toBe(STREAM_PLACEHOLDER + tagOf(untag(results[0]!.displayContent!)!))
+  for (const r of results.slice(1)) expect(bare(r.displayContent ?? 'unset')).not.toContain('migration')
+  expect(results.slice(1).every(r => r.displayContent === ' .' || r.displayContent === '')).toBe(true)
+  // the final flush filed the whole original
+  const row = results.map(r => r.displayContent).join('')
+  await startTurn($, b)
+  const ui = await show($, row)
+  expect(await isOriginal(ui)).toBe(false)
+  await ui.unmount()
+})
+
+test('a later flush whose flush 0 never came passes through after the wait', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  await orchestrate($)
+  let result: { displayContent?: string } | undefined
+  const pending = flushOf($, { id: 'w-1', index: 2, final: false, delta: 'later line\n' }).then(r => (result = r))
+  await b.clock.settle()
+  expect(result).toBeUndefined()
+  await b.clock.advance(2000)
+  await pending
+  expect('displayContent' in result!).toBe(false)
+})
+
+test('an error in the handler leaves the flush as it is: no text is hidden', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  await orchestrate($)
+  // a flush the handler cannot file (no message id) throws inside it; the reply is not hidden
+  const broken = await $.classic.MessageDisplay({ turn_id: 'tt', index: 0, final: false, delta: `${MARK}\nbody\n` } as never)
+  expect('displayContent' in broken).toBe(false)
+  // the next reply is hidden as usual
+  const ok = await streamReply($, 'e-2', REPLY)
+  expect(ok.results[0]?.displayContent).toContain(STREAM_PLACEHOLDER)
+  expect(b.w.calls).toEqual([])
+})
+
+test('the committed row never shows plain text: placeholder, spinner while the final flush is slow, then the page', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  b.w.delays.set(options.source, 1500)
+  await orchestrate($)
+  await startTurn($, b)
+  const flushes = flushesOf('f-1', REPLY, 3)
+  const results: { displayContent?: string }[] = []
+  for (const f of flushes.slice(0, -1)) results.push(await flushOf($, f))
+  // the engine commits and draws the row before the final flush has ended
+  const ui = await show($, results.map(r => r.displayContent ?? '').join(''))
+  expect(await isOriginal(ui)).toBe(false)
+  expect(await texts(ui)).toEqual([spin(0, 0)])
+  // the final flush is slow (a hook beneath ours takes 500 ms)
+  b.w.finalDelay = 500
+  const finalPending = flushOf($, flushes[flushes.length - 1]!)
+  await b.clock.advance(300)
+  expect(await isOriginal(ui)).toBe(false)
+  expect(await texts(ui)).toEqual([spin(3, 0)])
+  b.w.finalDelay = 0
+  await b.clock.advance(300)
+  const last = await finalPending
+  expect(last.displayContent).toBe('')
+  // the original is complete now; the turn still runs, so the row is still the spinner
+  expect(await isOriginal(ui)).toBe(false)
+  expect((await texts(ui))[0]).toMatch(/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] formatting reply · 0s$/)
+  // the turn ends: the conversion is claimed at once and the row stays the spinner, then becomes the page
+  await $.turn.complete({ answer: REPLY, durationMs: 1, isAborted: false, turnId: `u${turnSeq}`, reason: 'answer' } as never)
+  expect(await isOriginal(ui)).toBe(false)
+  await b.clock.settle()
+  expect(b.w.calls).toHaveLength(1)
+  expect(b.w.calls[0]!.prompt).toBe(options.source)
+  expect(await isOriginal(ui)).toBe(false)
+  expect((await texts(ui))[0]).toMatch(/formatting reply · \ds$/)
+  await b.clock.advance(1600)
+  expect(await isOriginal(ui)).toBe(false)
+  expect((await texts(ui)).join('\n')).toContain('Choose how to run the schema migration')
+  expect((await texts(ui)).join('\n')).not.toContain('formatting reply')
+  // the model's text was never drawn by the engine, at any point
+  expect(rowsOf(b)).toEqual([])
+  await ui.unmount()
+})
+
+test('the row draws again when the final flush files the original, with no timer to do it', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  await orchestrate($)
+  // no turn runs, so nothing ticks: only the final flush can move the row
+  const flushes = flushesOf('r-1', REPLY, 3)
+  const results: { displayContent?: string }[] = []
+  for (const f of flushes.slice(0, -1)) results.push(await flushOf($, f))
+  const ui = await show($, results.map(r => r.displayContent ?? '').join(''))
+  expect(await texts(ui)).toEqual([spin(0, 0)])
+  expect(await quiet(b, 500)).toBe(0)
+  expect(await texts(ui)).toEqual([spin(0, 0)])
+  await flushOf($, flushes[flushes.length - 1]!)
+  await b.clock.settle()
+  // an old marked reply with no entry and no turn: as written, marker gone
+  expect(await isOriginal(ui)).toBe(true)
+  expect(rowsOf(b).at(-1)).toBe(options.source.trim())
+  await ui.unmount()
+})
+
+test('a hidden reply whose conversion failed is the original with its marker removed, the tag gone, and one reason line', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, { reason: 'api-error' })
+  await orchestrate($)
+  await startTurn($, b)
+  const { row } = await streamReply($, 'k-1', REPLY)
+  const ui = await show($, row)
+  await finish($, b, REPLY)
+  expect(b.w.calls).toHaveLength(1)
+  expect(await isOriginal(ui)).toBe(false)
+  const t = await texts(ui)
+  expect(t).toContain(REASON('api-error'))
+  // the original text goes to the engine: marker and tag are gone
+  expect(rowsOf(b)).toEqual([options.source.trim()])
+  expect(rowsOf(b).join('').match(/[\u200b\u200c\u2060]/)).toBeNull()
+  await ui.unmount()
+})
+
+test('a hidden reply that is not eligible for the model (short) is as written once the turn ends; it spins only while it streams', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  await orchestrate($)
+  await startTurn($, b)
+  const short = `${MARK}\nAll done, nothing to decide.`
+  const { row } = await streamReply($, 'sh-1', short)
+  const ui = await show($, row)
+  expect(await texts(ui)).toEqual([spin(0, 0)])
+  await finish($, b, short)
+  expect(b.w.calls).toEqual([])
+  expect(rowsOf(b)).toEqual(['All done, nothing to decide.'])
+  await ui.unmount()
+})
+
+test('a turn that ends without its last flush shows what was received as written', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  await orchestrate($)
+  await startTurn($, b)
+  const flushes = flushesOf('a-1', REPLY, 3)
+  const results: { displayContent?: string }[] = []
+  for (const f of flushes.slice(0, 3)) results.push(await flushOf($, f))
+  const row = results.map(r => r.displayContent ?? '').join('')
+  const ui = await show($, row)
+  expect(await texts(ui)).toEqual([spin(0, 0)])
+  await endTurn($, b, 'aborted')
+  expect(await isOriginal(ui)).toBe(true)
+  const drawn = rowsOf(b)
+  expect(drawn).toHaveLength(1)
+  expect(drawn[0]).toContain('The migration to the new database schema')
+  expect(drawn[0]).not.toContain(MARK)
+  expect(drawn[0]!.match(/[\u200b\u200c\u2060]/)).toBeNull()
+  await ui.unmount()
+})
+
+test('a tag whose original is gone (a reload, a /clear) is drawn as its own line with the tag removed', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  await orchestrate($)
+  const lost = await show($, STREAM_PLACEHOLDER + tagOf('0badf00d'))
+  expect(await isOriginal(lost)).toBe(true)
+  expect(rowsOf(b)).toEqual([STREAM_PLACEHOLDER])
+  await lost.unmount()
+  // a /clear forgets the originals of the session
+  await startTurn($, b)
+  const { row } = await streamReply($, 'x-1', REPLY)
+  const ui = await show($, row)
+  expect(await texts(ui)).toEqual([spin(0, 0)])
+  await $.session.end({ reason: 'clear', sessionId: 's1' } as never)
+  await b.clock.settle()
+  expect(await isOriginal(ui)).toBe(true)
+  expect(rowsOf(b).at(-1)).toBe(bare(row))
+  await ui.unmount()
+})
+
+test('hiding a reply saves nothing in the store: only a finished page is saved, under its own key', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  await orchestrate($)
+  await startTurn($, b)
+  const { row } = await streamReply($, 'z-1', REPLY)
+  expect(b.w.storeOps.filter(o => o.startsWith('set:fmt:'))).toEqual([])
+  const ui = await show($, row)
+  await finish($, b, REPLY)
+  expect(fmtKeys(b).sort()).toEqual(['fmt:index', saved(options.source)].sort())
+  expect(JSON.stringify([...b.w.store.values()]).match(/[\u200b\u200c\u2060]/)).toBeNull()
+  await ui.unmount()
+})
+
+test('unchanged: a row without a tag (a resumed reply, an unmarked one) draws as before', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  await orchestrate($)
+  await finish($, b, REPLY)
+  const page = await show($, REPLY)
+  expect(await isOriginal(page)).toBe(false)
+  const plain = await show($, 'Plain reply that nobody marked.')
+  expect(await isOriginal(plain)).toBe(true)
+  await page.unmount()
+  await plain.unmount()
 })
