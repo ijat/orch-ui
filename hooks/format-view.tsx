@@ -857,6 +857,10 @@ type Stream = {
   settle: (v: boolean) => void
   // when flush 0 decided to hide the reply (the clock's ms), if it did and the clock answered
   since: number | undefined
+  // the final flush's index, once that flush came; flushes before it may still be on the way
+  last: number | undefined
+  // set once the block is finished (converted, kept, or settled as written at turn end), so it is finished once
+  done: boolean
 }
 // Open messages by message id. Module state: the hook of one flush must see what the others did, and a flush does not wait for the one before.
 const streams = new Map<string, Stream>()
@@ -874,7 +878,7 @@ function streamOf(messageId: string): Stream {
     const decided = new Promise<boolean>(resolve => {
       settle = resolve
     })
-    m = { tag: tagIdOf(messageId), deltas: [], verdict: undefined, decided, settle, since: undefined }
+    m = { tag: tagIdOf(messageId), deltas: [], verdict: undefined, decided, settle, since: undefined, last: undefined, done: false }
     streams.set(messageId, m)
     if (streams.size > STREAMS_MAX) streams.delete(streams.keys().next().value as string)
   }
@@ -934,6 +938,20 @@ async function startBlock($: EngineInterface, original: string, begun: number | 
   $.clock.after(0, () => void convert($, text, seq, false, claimed).catch(() => undefined))
 }
 
+// Finishes a hidden block once every flush up to the final one has come, whichever flush brought the last piece. The
+// check and the `done` mark run with no await before them, so two flushes can never both finish one block.
+async function finishIfComplete($: EngineInterface, id: string, m: Stream) {
+  if (m.done || m.last === undefined || !isComplete(m, m.last)) return
+  m.done = true
+  streams.delete(id)
+  const original = deltaText(m)
+  // This block's conversion starts now, not at the end of the turn (D12). The claim is taken before the row can draw as
+  // final, so it goes from the placeholder to the pending one with nothing between.
+  await startBlock($, original, m.since).catch(() => undefined)
+  holdText(m.tag, { text: original, final: true, since: m.since })
+  await bumpHeld($)
+}
+
 type Flush = { message_id: string; index: number; final: boolean; delta: string; agent_id?: string }
 
 // The `displayContent` of one flush, or undefined to leave it as it is. The part before the first await runs when the
@@ -943,6 +961,7 @@ async function displayOf($: EngineInterface, e: Flush): Promise<string | undefin
   if (e.agent_id !== undefined) return undefined
   const m = streamOf(e.message_id)
   if (m.verdict !== false) m.deltas[e.index] = e.delta
+  if (e.final) m.last = e.index
   if (e.index === 0) {
     let verdict = false
     try {
@@ -960,25 +979,21 @@ async function displayOf($: EngineInterface, e: Flush): Promise<string | undefin
     if (e.final) streams.delete(e.message_id)
     return undefined
   }
-  if (e.final) {
-    const original = isComplete(m, e.index) ? deltaText(m) : null
-    // The original is complete: this block's conversion starts now, not at the end of the turn (D12). The claim is taken
-    // before the row can draw as final, so it goes from the placeholder to the pending one with nothing between.
-    if (original !== null) await startBlock($, original, m.since).catch(() => undefined)
-    holdText(m.tag, { text: original, final: true, since: m.since })
-    streams.delete(e.message_id)
-    await bumpHeld($)
-  }
+  // A final flush that came before an earlier one leaves the block open (the row stays the placeholder): the flush that
+  // fills the last hole finishes it, or the turn's end settles it as written.
+  await finishIfComplete($, e.message_id, m)
   if (e.index === 0) return PLACEHOLDER + tagOf(m.tag)
   return !e.final && e.index <= DOTS ? ' .' : ''
 }
 
-// A turn that ended without its last flush (interrupted, refused, failed): what was received is the original, so the
-// committed row shows it as written instead of waiting for a flush that is not coming.
+// A turn that ended with a hidden block still open (its last flush, or one before a final flush that came early, never
+// came): what was received is the original, so the committed row shows it as written instead of waiting for a flush
+// that is not coming. Runs at every turn end, the answer included.
 async function closeStreams($: EngineInterface) {
   let any = false
   for (const [id, m] of streams) {
-    if (m.verdict !== true) continue
+    if (m.verdict !== true || m.done) continue
+    m.done = true
     holdText(m.tag, { text: deltaText(m), final: true, since: m.since })
     streams.delete(id)
     any = true
@@ -1078,6 +1093,8 @@ export function registerFormat(on: On) {
       }
       return done
     } finally {
+      // A hidden block still open (a flush before its final one never came) is drawn as written, not left spinning.
+      await closeStreams($).catch(() => undefined)
       await endTurn($).catch(() => undefined)
     }
   })

@@ -2605,7 +2605,7 @@ test('a short marked block before a slow tool call is as written right after its
   await ui.unmount()
 })
 
-test('a final flush that arrives before an earlier one is not a complete original: nothing is converted', async ($, on) => {
+test('a final flush that arrives before an earlier one leaves the placeholder; the late flush completes the block and it converts', async ($, on) => {
   const b = await boot($, on, MARKED_MODE)
   b.w.replies.set(options.source, options.output)
   await orchestrate($)
@@ -2613,12 +2613,54 @@ test('a final flush that arrives before an earlier one is not a complete origina
   const flushes = flushesOf('oo-1', REPLY, 3)
   expect(flushes.length).toBeGreaterThan(2)
   // flush 0 hides the reply; the final one comes before the ones between
-  await flushOf($, flushes[0]!)
-  await flushOf($, flushes[flushes.length - 1]!)
+  const r0 = await flushOf($, flushes[0]!)
+  const rLast = await flushOf($, flushes[flushes.length - 1]!)
+  const ui = await show($, (r0.displayContent ?? '') + (rLast.displayContent ?? ''))
   await b.clock.advance(200)
+  // not complete: nothing is converted, and the row is the placeholder, not a static line
   expect(b.w.calls).toEqual([])
-  await endTurn($, b, 'aborted')
-  expect(b.w.calls).toEqual([])
+  expect(await isOriginal(ui)).toBe(false)
+  expect((await texts(ui))[0]).toMatch(/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] formatting reply · 0s$/)
+  // the late flushes land: the block is complete and converts now, before the turn ends
+  for (const f of flushes.slice(1, -1)) await flushOf($, f)
+  await b.clock.settle()
+  expect(b.w.calls).toHaveLength(1)
+  expect(b.w.calls[0]!.prompt).toBe(options.source)
+  // the turn's end finds the claim taken: no second call, and the row is the page
+  await finish($, b, REPLY)
+  expect(b.w.calls).toHaveLength(1)
+  expect(await isOriginal(ui)).toBe(false)
+  expect((await texts(ui)).join('\n')).toContain('Choose how to run the schema migration')
+  expect((await texts(ui)).join('\n')).not.toContain('formatting reply')
+  expect(rowsOf(b)).toEqual([])
+  await ui.unmount()
+})
+
+test('a final flush that came early whose earlier flush never comes: the answer turn end draws what arrived as written', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  await orchestrate($)
+  await startTurn($, b)
+  const flushes = flushesOf('oo-2', REPLY, 3)
+  expect(flushes.length).toBeGreaterThan(2)
+  const results = [await flushOf($, flushes[0]!), await flushOf($, flushes[flushes.length - 1]!)]
+  const ui = await show($, results.map(r => r.displayContent ?? '').join(''))
+  expect((await texts(ui))[0]).toMatch(/formatting reply · \ds$/)
+  // the turn ends with its answer while flush 1 is still missing: the block is settled as written, not left spinning
+  await finish($, b, REPLY)
+  expect(await isOriginal(ui)).toBe(true)
+  const drawn = rowsOf(b).at(-1)!
+  expect(drawn).toContain(flushes[flushes.length - 1]!.delta.trim())
+  expect(drawn).not.toContain(MARK)
+  expect(drawn).not.toContain('formatting reply')
+  expect(drawn.match(/[\u200b\u200c\u2060]/)).toBeNull()
+  // the missing flush lands after the turn: what is drawn does not change (no fragment after a placeholder)
+  const late = flushOf($, flushes[1]!)
+  await b.clock.advance(2500)
+  await late
+  expect(await isOriginal(ui)).toBe(true)
+  expect(rowsOf(b).at(-1)).toBe(drawn)
+  await ui.unmount()
 })
 
 test('two calls that start the timer together make one timer, and it is cancelled when the turn ends', async ($, on) => {
