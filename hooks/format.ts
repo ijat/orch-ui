@@ -2,7 +2,7 @@
 // No runtime imports, so the benchmark can import this file with plain `node` (types are stripped).
 // Drawing and wiring live in format-view.tsx and register.tsx.
 
-import type { BannerTag, Part, Row, RowTag, RouteKind, SectionTag } from '../types'
+import type { BannerTag, Billing, CallOutcome, CallReason, CallRequest, Effort, Part, Row, RowTag, RouteKind, SectionTag } from '../types'
 
 // -- routes ---------------------------------------------------------------------------------------
 
@@ -22,7 +22,7 @@ export const SHORT_MIN = 300
 export const SHORT_MAX = 2000
 export const LONG_MAX = 5000
 
-export type { RouteKind } from '../types'
+export type { Billing, CallOutcome, CallReason, CallRequest, Effort, RouteKind } from '../types'
 export type Route = { kind: RouteKind; model: string; effort: string; maxTokens: number; timeoutMs: number }
 
 const FENCE_ANY = /```|^\s*~~~/m
@@ -320,4 +320,168 @@ export function validate(source: string, output: string): Verdict {
   } catch {
     return { ok: false, reason: 'error' }
   }
+}
+
+// -- one formatter call through a `claude -p` child -------------------------------------------------
+// Pure: this builds the argv and the environment of one call and checks the stream it printed. Running
+// the child is format-call.ts's job. cliArgs, cliEnv and verifyRun decide which credential pays, so
+// each refuses a value it does not know instead of guessing.
+
+export const MODELS = ['opus', 'sonnet', 'haiku'] as const
+export const EFFORTS = ['low', 'medium', 'high'] as const
+export const DEFAULT_MODEL = 'opus'
+export const DEFAULT_EFFORT = 'low'
+
+// Output cap and time limit by length and effort: the larger of the step 1 placeholder and twice the
+// largest maximum the step 2b benchmark saw at that effort over all models, rounded up.
+export const LIMITS: Record<RouteKind, Record<Effort, { maxTokens: number; timeoutMs: number }>> = {
+  short: {
+    low: { maxTokens: 6000, timeoutMs: 30000 },
+    medium: { maxTokens: 9000, timeoutMs: 40000 },
+    high: { maxTokens: 18000, timeoutMs: 80000 },
+  },
+  long: {
+    low: { maxTokens: 13000, timeoutMs: 90000 },
+    medium: { maxTokens: 20000, timeoutMs: 90000 },
+    high: { maxTokens: 38000, timeoutMs: 150000 },
+  },
+}
+
+// An unknown effort reads as the default effort, and an unknown kind as the long one (the larger limits).
+export function limits(kind: RouteKind, effort: string): { maxTokens: number; timeoutMs: number } {
+  const byEffort = LIMITS[kind] ?? LIMITS.long
+  return (byEffort as Record<string, { maxTokens: number; timeoutMs: number }>)[effort] ?? byEffort[DEFAULT_EFFORT]
+}
+
+// Reasons that stop formatting for the session until a settings row is pressed.
+export const PAUSE_REASONS: readonly CallReason[] = [
+  'billing-mismatch', 'model-mismatch', 'no-credential', 'auth-failed', 'cli-missing', 'cloud-provider', 'base-url-set', 'workdir-failed',
+]
+
+const isBilling = (b: unknown): b is Billing => b === 'api' || b === 'subscription'
+
+// The argv after `claude`. The system prompt is the only caller text in it (the message goes on stdin).
+// `--bare` makes auth strictly ANTHROPIC_API_KEY, so an api run can never fall back to the login.
+export function cliArgs(a: { model: string; effort: string; system: string; billing: Billing }): string[] {
+  if (!isBilling(a.billing)) throw new Error('cliArgs: unknown billing')
+  if (!(MODELS as readonly string[]).includes(a.model)) throw new Error('cliArgs: unknown model')
+  if (!(EFFORTS as readonly string[]).includes(a.effort)) throw new Error('cliArgs: unknown effort')
+  return [
+    '-p', ...(a.billing === 'api' ? ['--bare'] : []),
+    '--model', a.model, '--effort', a.effort,
+    '--output-format', 'stream-json', '--verbose',
+    '--setting-sources', '', '--strict-mcp-config', '--disable-slash-commands', '--tools', '', '--no-session-persistence',
+    '--system-prompt', a.system,
+  ]
+}
+
+// The variables set over the session's own environment for one child. ANTHROPIC_AUTH_TOKEN is blanked
+// in every mode: a host bearer would be used over the login and under `--bare`, and the stream cannot show
+// it. The subscription blanks the key so the login is used; an api run without a key sets none (the child
+// inherits the session's, or `--bare` fails with no credential). Nothing else is set.
+export function cliEnv(a: { billing: Billing; maxTokens: number; key?: string }): Record<string, string> {
+  if (!isBilling(a.billing)) throw new Error('cliEnv: unknown billing')
+  if (!Number.isInteger(a.maxTokens) || a.maxTokens <= 0) throw new Error('cliEnv: maxTokens must be a positive integer')
+  const env: Record<string, string> = { CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(a.maxTokens), ANTHROPIC_AUTH_TOKEN: '' }
+  if (a.billing === 'subscription') {
+    if (a.key !== undefined) throw new Error('cliEnv: a key with subscription billing')
+    env.ANTHROPIC_API_KEY = ''
+  } else if (a.key !== undefined) {
+    if (typeof a.key !== 'string' || a.key === '') throw new Error('cliEnv: empty key')
+    env.ANTHROPIC_API_KEY = a.key
+  }
+  return env
+}
+
+const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+const money = (v: unknown): number => {
+  const n = num(v)
+  return n !== null && n >= 0 ? n : 0
+}
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+
+// Checks one run's stream-json stdout and turns it into an outcome. Never throws. Lines that are not
+// JSON objects are skipped. The init line's `apiKeySource` is the proof of the billing:
+// `none` means no API key was used. It cannot tell the claude.ai login from a bearer token, which
+// cliEnv blanks, so that route is closed by the environment and not by this check.
+export function verifyRun(stdout: string, expect: { billing: Billing; model: string; maxTokens: number }): CallOutcome {
+  try {
+    const lines: Record<string, unknown>[] = []
+    for (const raw of String(stdout).split('\n')) {
+      const t = raw.trim()
+      if (!t) continue
+      try {
+        const v: unknown = JSON.parse(t)
+        if (isObject(v)) lines.push(v)
+      } catch {
+        // A warning line: skipped.
+      }
+    }
+    const inits = lines.filter(l => l.type === 'system' && l.subtype === 'init')
+    const results = lines.filter(l => l.type === 'result')
+    const spent = results.reduce((sum, r) => sum + money(r.total_cost_usd), 0)
+    const result = results[0]
+    if (inits.length !== 1 || results.length !== 1 || !result || lines[lines.length - 1] !== result) {
+      return { ok: false, reason: 'cli-output', costUsd: spent }
+    }
+    const costUsd = spent
+
+    const wanted = expect.billing === 'api' ? 'ANTHROPIC_API_KEY' : expect.billing === 'subscription' ? 'none' : null
+    const source = inits[0]?.apiKeySource
+    if (typeof source !== 'string' || wanted === null || source !== wanted) return { ok: false, reason: 'billing-mismatch', costUsd }
+
+    const usage = isObject(result.usage) ? result.usage : {}
+    const outputTokens = Math.max(0, num(usage.output_tokens) ?? 0)
+    if (result.is_error === true) {
+      const status = num(result.api_error_status)
+      if (status === 401 || status === 403) return { ok: false, reason: 'auth-failed', costUsd }
+      if (status === 429) return { ok: false, reason: 'rate-limited', costUsd }
+      if (status === 529) return { ok: false, reason: 'overloaded', costUsd }
+      if (status !== null) return { ok: false, reason: 'api-error', costUsd }
+      if (outputTokens === 0 && costUsd === 0) return { ok: false, reason: 'no-credential', costUsd }
+      if (outputTokens > 0) return { ok: false, reason: 'truncated', costUsd }
+      return { ok: false, reason: 'cli-error', costUsd }
+    }
+
+    const used = isObject(result.modelUsage) ? Object.keys(result.modelUsage) : []
+    const prefix = `claude-${expect.model}-`
+    if (used.length === 0 || !used.every(k => k.startsWith(prefix))) return { ok: false, reason: 'model-mismatch', costUsd }
+
+    if (result.is_error !== false || result.stop_reason !== 'end_turn' || typeof result.result !== 'string' || result.result === '') {
+      return { ok: false, reason: 'no-answer', costUsd }
+    }
+    if (outputTokens >= expect.maxTokens) return { ok: false, reason: 'truncated', costUsd }
+    return {
+      ok: true, text: result.result, costUsd, outputTokens,
+      durationMs: Math.max(0, num(result.duration_ms) ?? 0), durationApiMs: Math.max(0, num(result.duration_api_ms) ?? 0),
+    }
+  } catch {
+    return { ok: false, reason: 'cli-output', costUsd: 0 }
+  }
+}
+
+// -- the single attempt -------------------------------------------------------------------------------
+
+export type FormatResult =
+  | { ok: true; parts: Part[]; costUsd: number; durationMs: number }
+  | { ok: false; reason: Reason | CallReason; costUsd: number }
+
+// One call, one validation. `call` runs the child (step 9). A call that fails, or throws, ends the
+// attempt; the message of a throw is not kept.
+export async function formatOnce(
+  source: string,
+  how: { model: string; effort: string; kind: RouteKind },
+  call: (req: CallRequest) => Promise<CallOutcome>,
+): Promise<FormatResult> {
+  let out: CallOutcome
+  try {
+    out = await call({ system: FORMAT_SYSTEM, prompt: source, model: how.model, effort: how.effort, kind: how.kind })
+  } catch {
+    return { ok: false, reason: 'cli-failed', costUsd: 0 }
+  }
+  if (!isObject(out)) return { ok: false, reason: 'cli-failed', costUsd: 0 }
+  const costUsd = money(out.costUsd)
+  if (out.ok !== true) return { ok: false, reason: out.reason, costUsd }
+  const v = validate(source, out.text)
+  return v.ok ? { ok: true, parts: v.parts, costUsd, durationMs: out.durationMs } : { ok: false, reason: v.reason, costUsd }
 }
