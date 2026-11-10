@@ -3,7 +3,7 @@ import type { On } from 'claude-code'
 import type { Engine, MockClock } from 'claude-code/testing'
 
 import { FORMAT_SYSTEM, KINDS, LIMITS, MARK } from '../hooks/format'
-import { FORMAT_TOOL, FORMAT_TOOL_FULL, PILL_LEFT, PILL_RIGHT } from '../hooks/format-view'
+import { FORMAT_TOOL, FORMAT_TOOL_FULL, FRAMES, PILL_LEFT, PILL_RIGHT } from '../hooks/format-view'
 import * as cli from './fixtures/format/cli'
 import * as done from './fixtures/format/done'
 import * as long from './fixtures/format/long'
@@ -33,6 +33,10 @@ type World = {
   // files by path (text and the `ls -ln` mode), what was stat-ed, read and written, every process.run argv, every ui.log message
   files: Map<string, { text: string; mode: string; acl?: string[] }>; stats: string[]; reads: string[]; written: string[]; runs: string[][]; logs: string[]
   cost: number; lsExit: number; aclExit: number; truncated: boolean
+  // how many fake child runs are moving the clock to their end right now (see boot)
+  advancing: number
+  // how many periods the animation timer was asked for (one clock.every dispatch each)
+  periods: number
   // the text the engine itself was asked to draw (a row no hook redrew)
   engineRows: string[]
   // the description of each tool registered
@@ -44,10 +48,39 @@ const argAfter = (argv: string[], flag: string) => argv[argv.indexOf(flag) + 1] 
 
 // The engine beneath the plugin: just enough for session.start, the child process, the files, the store and the tool registry.
 async function boot($: Engine, on: On, seed: Record<string, unknown> = { 'opt:format': true }, envVars: Record<string, string> = { HOME: '/home/u' }) {
-  const clock = mock.clock(on, { now: Date.parse('2026-11-10T10:00Z') })
+  const periodsSeen = { n: 0 }
+  on('clock.every', { ms: 100 }, async (_, e, next) => {
+    periodsSeen.n += 1
+    return next(e)
+  })
+  const mc = mock.clock(on, { now: Date.parse('2026-11-10T10:00Z') })
   const w: World = {
     calls: [], tools: [], commands: [], opened: [], store: new Map(Object.entries({ 'opt:format-trigger': 'auto', ...seed })), replies: new Map(), delays: new Map(),
-    env: { ...envVars }, envAsked: [], files: new Map(), stats: [], reads: [], written: [], runs: [], logs: [], cost: 0.0061, lsExit: 0, aclExit: 0, truncated: false, engineRows: [], descriptions: [],
+    env: { ...envVars }, envAsked: [], files: new Map(), stats: [], reads: [], written: [], runs: [], logs: [], cost: 0.0061, lsExit: 0, aclExit: 0, truncated: false, advancing: 0, periods: 0, engineRows: [], descriptions: [],
+  }
+  // A fake run that lasts N ms moves the clock N ms from inside its hook. The animation timer ticks every 100 ms on the
+  // way, and the mock clock resolves them one at a time as the test's own calls come, so settle and advance go on until such a run is over.
+  // Moves the clock exactly `ms` on. With the animation timer running, advance stops at its last tick, not at the end; a
+  // wait due at the end makes it stop there.
+  const moveBy = async (ms: number) => {
+    const wake = mc.sleep(ms)
+    await mc.advance(ms)
+    await wake
+  }
+  const drain = async () => {
+    for (let i = 0; i < 5000 && w.advancing > 0; i++) await mc.settle()
+  }
+  Object.defineProperty(w, 'periods', { get: () => periodsSeen.n })
+  const clock: MockClock = {
+    ...mc,
+    settle: async () => {
+      await mc.settle()
+      await drain()
+    },
+    advance: async ms => {
+      await mc.advance(ms)
+      await drain()
+    },
   }
   on('ui.render', { component: 'AssistantMessage' }, async (_, e, next) => {
     w.engineRows.push(e.props.text)
@@ -116,7 +149,12 @@ async function boot($: Engine, on: On, seed: Record<string, unknown> = { 'opt:fo
     if (typeof r === 'string') return ran(cli.resultOk(r, used))
     if ('deny' in r) return { deny: r.deny }
     if ('rejectAfter' in r) {
-      await clock.advance(r.rejectAfter)
+      w.advancing++
+      try {
+        await moveBy(r.rejectAfter)
+      } finally {
+        w.advancing--
+      }
       return { deny: 'killed' }
     }
     if ('stdout' in r) return { value: { exitCode: 0, stdout: r.stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -124,11 +162,17 @@ async function boot($: Engine, on: On, seed: Record<string, unknown> = { 'opt:fo
     if (r.reason === 'api-error') return ran(cli.resultApiError(500, used))
     if (r.reason === 'aborted') {
       // The run reaches its time limit: the clock shows it, and the call rejects.
-      await clock.advance(e.init?.timeoutMs ?? 0)
+      w.advancing++
+      try {
+        await moveBy(e.init?.timeoutMs ?? 0)
+      } finally {
+        w.advancing--
+      }
       return { deny: 'timed out' }
     }
     return ran(cli.resultOk('', used))
   })
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
   on('skill.prompt', (_, e) => ({ text: e.text }))
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
@@ -677,7 +721,6 @@ test('/clear forgets the marking, the raw state and the list; the option stays',
   b.w.replies.set(review.source, review.output)
   await finish($, b, review.source)
   expect(b.w.calls).toHaveLength(2)
-  // Loaded again: nothing is raw any more, the old entries draw formatted, and the list is empty so "raw" has nothing to mark.
   await orchestrate($)
   expect(await isOriginal(first)).toBe(false)
   expect(await isOriginal(second)).toBe(false)
@@ -1448,7 +1491,7 @@ test('a marked row is drawn without its marker line when it is not converted: op
   await desktop.unmount()
 })
 
-test('a normal session: only the marker line goes, a marker elsewhere and every other row pass untouched', async ($, on) => {
+test('a normal session: only the marker line goes (first or last line), a marker elsewhere and every other row pass untouched', async ($, on) => {
   const b = await boot($, on)
   const rows = [
     `Plain reply.\n\n${MARK}`,
@@ -1462,7 +1505,7 @@ test('a normal session: only the marker line goes, a marker elsewhere and every 
     const ui = await show($, text)
     await ui.unmount()
   }
-  expect(rowsOf(b)).toEqual(['Plain reply.', rows[1], rows[2], rows[3], rows[4], rows[5]])
+  expect(rowsOf(b)).toEqual(['Plain reply.', rows[1], 'Plain reply.', rows[3], rows[4], rows[5]])
   expect(b.w.calls).toEqual([])
   expect(formatTools(b.w)).toEqual([])
 })
@@ -1622,4 +1665,368 @@ test('the raw tool\'s description names "format that" and forbids writing the re
   const b = await boot($, on)
   await orchestrate($)
   expect(b.w.descriptions.some(d => d.includes('"format that"') && d.includes('never write the reply again'))).toBe(true)
+})
+
+// -- the first-line marker and the placeholder -------------------------------------------------------------------
+// A marked reply is drawn as a one-line rounded page with a spinner from its first streamed characters until the
+// formatted page is ready; a failure or a pause draws the text as written with one dim reason line.
+
+const first = (text: string) => `${MARK}\n\n${text}`
+const spin = (n: number, secs: number) => `${FRAMES[n % FRAMES.length]} formatting reply · ${secs}s`
+const REASON = (why: string) => `orch-ui: shown as written (${why})`
+let turnSeq = 0
+async function startTurn($: Engine, b: Booted, extra: Record<string, unknown> = {}) {
+  turnSeq += 1
+  await $.turn.start({ text: 'go', turnId: `u${turnSeq}`, ...extra } as never)
+  await b.clock.settle()
+}
+async function endTurn($: Engine, b: Booted, reason: string) {
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: reason === 'aborted', turnId: `u${turnSeq}`, reason } as never)
+  await b.clock.settle()
+}
+// Moves the clock on and returns how many periods of the animation timer that took.
+async function quiet(b: Booted, ms = 1000) {
+  const before = b.w.periods
+  await b.clock.advance(ms)
+  return b.w.periods - before
+}
+
+test('a reply that starts with the marker converts from the text after it; one that ends with it still does, and both strip', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  b.w.replies.set(done.source, done.output)
+  await orchestrate($)
+  await finish($, b, first(options.source))
+  await finish($, b, marked(done.source))
+  expect(b.w.calls.map(c => c.prompt)).toEqual([options.source, done.source])
+  for (const text of [first(options.source), marked(done.source), first(done.source)]) {
+    const ui = await show($, text)
+    expect(await isOriginal(ui)).toBe(false)
+    await ui.unmount()
+  }
+  // the same reply with the marker on either end is one key
+  expect(b.w.calls).toHaveLength(2)
+})
+
+const STREAMING: [string, string][] = [
+  ['the first character of the marker', '<'],
+  ['a start of the marker', '<!-- orch'],
+  ['the whole marker', MARK],
+  ['the marker and a newline', `${MARK}\n`],
+  ['the marker and the start of the text', `${MARK}\n\nThe migration needs`],
+]
+for (const [name, text] of STREAMING) {
+  test(`while a marked reply streams in, ${name} is drawn as the placeholder and the text never shows`, async ($, on) => {
+    const b = await boot($, on, MARKED_MODE)
+    await orchestrate($)
+    await startTurn($, b)
+    const ui = await show($, text)
+    expect(await isOriginal(ui)).toBe(false)
+    expect(await texts(ui)).toEqual([spin(0, 0)])
+    expect(rowsOf(b)).toEqual([])
+    await ui.unmount()
+  })
+}
+
+test('the placeholder is the same rounded page as the formatted reply, with the spinner line inside', async ($, on) => {
+  const b = await boot($, on)
+  b.w.replies.set(options.source, options.output)
+  await orchestrate($)
+  await startTurn($, b)
+  const stream = await show($, MARK)
+  const root = (await stream.drawn()) as Node
+  expect(root.props).toMatchObject({ borderStyle: 'round', borderColor: 'inactive', paddingX: 2, paddingY: 1, flexDirection: 'column' })
+  await stream.unmount()
+  const page = await tree($, b, options.source, options.output)
+  const formatted = page.nodes.find(x => x.node.type === 'Box' && x.node.props?.borderStyle === 'round' && x.node.props?.borderColor === 'inactive')!.node
+  await page.ui.unmount()
+  for (const k of ['borderStyle', 'borderColor', 'paddingX', 'paddingY', 'flexDirection']) expect([k, root.props?.[k]]).toEqual([k, formatted.props?.[k]])
+})
+
+test('a pending conversion is the placeholder: frames every 100 ms, whole seconds since it started, then the formatted page', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  b.w.delays.set(options.source, 2600)
+  await orchestrate($)
+  await finish($, b, first(options.source))
+  const ui = await show($, first(options.source))
+  expect(await texts(ui)).toEqual([spin(0, 0)])
+  for (const [ms, frame, secs] of [[100, 1, 0], [100, 2, 0], [100, 3, 0], [700, 10, 1], [1000, 20, 2]] as const) {
+    await b.clock.advance(ms)
+    expect([ms, await texts(ui)]).toEqual([ms, [spin(frame, secs)]])
+  }
+  expect(rowsOf(b)).toEqual([])
+  await b.clock.advance(1000)
+  expect(await isOriginal(ui)).toBe(false)
+  expect((await texts(ui)).some(t => t.includes('formatting reply'))).toBe(false)
+  expect((await texts(ui)).join('\n')).toContain('Choose how to run the schema migration')
+  await ui.unmount()
+})
+
+test('the streaming placeholder counts its seconds from the start of the turn, and a pending one from its claim', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  b.w.delays.set(options.source, 5000)
+  await orchestrate($)
+  await startTurn($, b)
+  const ui = await show($, MARK)
+  await b.clock.advance(2000)
+  expect(await texts(ui)).toEqual([spin(20, 2)])
+  await finish($, b, first(options.source))
+  const row = await show($, first(options.source))
+  expect(await texts(row)).toEqual([spin(20, 0)])
+  await b.clock.advance(1000)
+  expect(await texts(row)).toEqual([spin(30, 1)])
+  await ui.unmount()
+  await row.unmount()
+})
+
+test('the row goes from the streaming placeholder to the pending one with no plain text between', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  b.w.delays.set(options.source, 5000)
+  await orchestrate($)
+  await startTurn($, b)
+  const ui = await show($, first(options.source))
+  expect(await texts(ui)).toEqual([spin(0, 0)])
+  // the turn ends and the hook returns before the timer that starts the call has run
+  await $.turn.complete({ answer: first(options.source), durationMs: 1, isAborted: false, turnId: `u${turnSeq}`, reason: 'answer' } as never)
+  expect(b.w.calls).toEqual([])
+  expect(await texts(ui)).toEqual([spin(0, 0)])
+  expect(rowsOf(b)).toEqual([])
+  await b.clock.settle()
+  expect(b.w.calls).toHaveLength(1)
+  expect(await texts(ui)).toEqual([spin(0, 0)])
+  await ui.unmount()
+})
+
+test('the timer exists only while a conversion is pending or a turn runs: none remains after the conversion and the turn end', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  b.w.delays.set(options.source, 2000)
+  await orchestrate($)
+  expect(await quiet(b)).toBe(0)
+  await startTurn($, b)
+  expect(await quiet(b)).toBeGreaterThan(0)
+  await finish($, b, first(options.source))
+  expect(await quiet(b, 500)).toBeGreaterThan(0)
+  // the call ends at 2000 ms; after it nothing runs
+  await b.clock.advance(1600)
+  expect(b.w.calls).toHaveLength(1)
+  expect(await quiet(b)).toBe(0)
+  expect(await quiet(b, 5000)).toBe(0)
+  // and a new turn starts one again
+  await startTurn($, b)
+  expect(await quiet(b)).toBeGreaterThan(0)
+  await endTurn($, b, 'aborted')
+  expect(await quiet(b, 3000)).toBe(0)
+})
+
+for (const reason of ['aborted', 'error', 'refusal']) {
+  test(`a turn that ends with ${reason} ends the turn: the timer stops and the streaming row is as written`, async ($, on) => {
+    const b = await boot($, on, MARKED_MODE)
+      await orchestrate($)
+    await startTurn($, b)
+    const ui = await show($, first(options.source))
+    expect(await texts(ui)).toEqual([spin(0, 0)])
+    await endTurn($, b, reason)
+    expect(await quiet(b, 2000)).toBeLessThan(2)
+    expect(await quiet(b, 2000)).toBe(0)
+    expect(rowsOf(b)).toEqual([options.source])
+    await ui.unmount()
+  })
+}
+
+test('one timer serves several pending conversions; it stops when the last one ends', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  b.w.replies.set(done.source, done.output)
+  b.w.delays.set(options.source, 1000)
+  b.w.delays.set(done.source, 3000)
+  await orchestrate($)
+  await finish($, b, first(options.source))
+  await finish($, b, first(done.source))
+  const one = await quiet(b, 500)
+  const ui = await show($, first(done.source))
+  await b.clock.advance(1000)
+  expect(b.w.calls).toHaveLength(2)
+  // 1500 ms in: the first ended, the second still runs
+  expect(await texts(ui)).toEqual([spin(15, 1)])
+  expect(one).toBeGreaterThan(0)
+  expect(await quiet(b, 500)).toBeGreaterThan(0)
+  await b.clock.advance(1100)
+  expect(await isOriginal(ui)).toBe(false)
+  expect(await quiet(b, 3000)).toBe(0)
+  await ui.unmount()
+})
+
+test('/clear stops the timer, and a conversion that ends afterwards does not start it again', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  b.w.delays.set(options.source, 3000)
+  await orchestrate($)
+  await startTurn($, b)
+  await finish($, b, first(options.source))
+  expect(await quiet(b, 500)).toBeGreaterThan(0)
+  await $.session.end({ reason: 'clear', sessionId: 's1' } as never)
+  expect(await quiet(b, 100)).toBeLessThan(2)
+  expect(await quiet(b, 4000)).toBe(0)
+})
+
+test('a marked reply that failed is the original text without the marker plus one dim reason line', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, { reason: 'api-error' })
+  await orchestrate($)
+  await finish($, b, first(options.source))
+  const ui = await show($, first(options.source))
+  expect(rowsOf(b)).toEqual([options.source])
+  expect(await texts(ui)).toEqual([REASON('api-error')])
+  const dim = (await ui.findAll({ type: 'Text' })).find(t => t.text === REASON('api-error'))
+  expect(dim).toBeDefined()
+  expect(((await ui.drawn()) as Node).type).not.toBe('engine')
+  await ui.unmount()
+  // the old place of the marker ends the same way
+  const last = await show($, marked(options.source))
+  expect(await texts(last)).toEqual([REASON('api-error')])
+  expect(rowsOf(b)).toEqual([options.source, options.source])
+  await last.unmount()
+})
+
+test('a marked reply that was paused shows the pause as the reason', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true, 'opt:format-trigger': undefined })
+  b.w.replies.set(options.source, { stdout: cli.stream(cli.init('none'), cli.resultOk(options.output, { total_cost_usd: 0.0061 })) })
+  await orchestrate($)
+  await finish($, b, first(options.source))
+  expect(await noteOf($)).toContain('paused: billing-mismatch')
+  // a later marked reply is not asked for; it shows the pause at once, even while it streams
+  await startTurn($, b)
+  const ui = await show($, first(done.source))
+  expect(rowsOf(b)).toEqual([done.source])
+  expect(await texts(ui)).toEqual([REASON('paused: billing-mismatch')])
+  const streaming = await show($, MARK)
+  expect(await texts(streaming)).toEqual([REASON('paused: billing-mismatch')])
+  await ui.unmount()
+  await streaming.unmount()
+})
+
+test('a raw reply is the original text with no reason line, streaming or not', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  await orchestrate($)
+  await callTool($, { format: 'raw', scope: 'session' })
+  await finish($, b, first(options.source))
+  await startTurn($, b)
+  const ui = await show($, first(options.source))
+  expect(await isOriginal(ui)).toBe(true)
+  expect(rowsOf(b)).toEqual([options.source])
+  const streaming = await show($, MARK)
+  expect(await isOriginal(streaming)).toBe(true)
+  await ui.unmount()
+  await streaming.unmount()
+})
+
+test('with the option off a marked row is the original text with no reason line', async ($, on) => {
+  const b = await boot($, on, {})
+  await orchestrate($)
+  await startTurn($, b)
+  const row = await show($, first(options.source))
+  expect(await isOriginal(row)).toBe(true)
+  expect(rowsOf(b).at(-1)).toBe(options.source)
+  await row.unmount()
+})
+
+test('"format that" on a marked reply that ended as written draws the placeholder again, then the page', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, { reason: 'api-error' })
+  b.w.delays.set(options.source, 1500)
+  await orchestrate($)
+  await finish($, b, first(options.source))
+  await b.clock.advance(1500)
+  const ui = await show($, first(options.source))
+  expect(await texts(ui)).toEqual([REASON('api-error')])
+  b.w.replies.set(options.source, options.output)
+  await callTool($, { format: 'formatted' })
+  await b.clock.settle()
+  expect(await texts(ui)).toEqual([spin(0, 0)])
+  await b.clock.advance(2000)
+  expect(await isOriginal(ui)).toBe(false)
+  expect((await texts(ui)).some(t => t.includes('formatting reply') || t.includes('shown as written'))).toBe(false)
+  await ui.unmount()
+})
+
+test('a marked reply with no entry that is not streaming is as written: an old one never spins in a later turn', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  await orchestrate($)
+  // drawn before any turn (a resumed transcript): as written
+  const old = await show($, first(options.source))
+  expect(await isOriginal(old)).toBe(true)
+  expect(rowsOf(b)).toEqual([options.source])
+  await startTurn($, b)
+  expect(await isOriginal(old)).toBe(true)
+  // a row that begins in this turn spins
+  const live = await show($, first(done.source))
+  expect(await texts(live)).toEqual([spin(0, 0)])
+  // the turn ends with no answer; the row is as written, and in the next turn it does not spin again
+  await endTurn($, b, 'aborted')
+  expect(await isOriginal(live)).toBe(true)
+  await startTurn($, b)
+  expect(await isOriginal(live)).toBe(true)
+  expect(await isOriginal(old)).toBe(true)
+  const fresh = await show($, MARK)
+  expect(await texts(fresh)).toEqual([spin(0, 0)])
+  await old.unmount()
+  await live.unmount()
+  await fresh.unmount()
+})
+
+test('a marked reply that was ineligible for the model (short) spins only while it streams', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  await orchestrate($)
+  await startTurn($, b)
+  const ui = await show($, first('Done.'))
+  expect(await texts(ui)).toEqual([spin(0, 0)])
+  await finish($, b, first('Done.'))
+  expect(b.w.calls).toEqual([])
+  expect(await isOriginal(ui)).toBe(true)
+  expect(rowsOf(b)).toEqual(['Done.'])
+  expect(await quiet(b, 2000)).toBe(0)
+  await ui.unmount()
+})
+
+test('unchanged: unmarked replies, normal sessions, subagent turns, summaries and other surfaces draw as before', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  // a normal session: the skill never loaded, a turn runs, a marked row is the text without its marker and nothing animates
+  await startTurn($, b)
+  const normal = await show($, first(options.source))
+  expect(await isOriginal(normal)).toBe(true)
+  const partial = await show($, '<!-- orch')
+  expect(await isOriginal(partial)).toBe(true)
+  await endTurn($, b, 'aborted')
+  expect(await quiet(b, 1000)).toBe(0)
+  expect(rowsOf(b)).toEqual([options.source, '<!-- orch'])
+  await orchestrate($)
+  // a subagent's turn is not the main turn
+  await startTurn($, b, { agentId: 'sub-1' })
+  const sub = await show($, first(done.source))
+  expect(await isOriginal(sub)).toBe(true)
+  expect(await quiet(b, 1000)).toBe(0)
+  // an unmarked reply streams as written
+  await startTurn($, b)
+  const plain = await show($, options.source.slice(0, 50))
+  expect(await isOriginal(plain)).toBe(true)
+  // a summary and a desktop row never get the placeholder
+  const summary = await show($, first(options.source), { isSummary: true })
+  expect(await isOriginal(summary)).toBe(true)
+  const desktop = await $.ui.mount({ plugin: 'orch-ui', surface: 'desktop', component: 'AssistantMessage', requestId: 'd7', props: { text: first(options.source), isFirstOfReply: true } })
+  expect(rowsOf(b).slice(-2)).toEqual([options.source, options.source])
+  for (const ui of [normal, partial, sub, plain, summary, desktop]) await ui.unmount()
+})
+
+test('with the option off or switched off, a turn runs no timer and marked rows are as written', async ($, on) => {
+  const b = await boot($, on, {})
+  await orchestrate($)
+  await startTurn($, b)
+  expect(await quiet(b, 1000)).toBe(0)
+  const ui = await show($, MARK)
+  expect(await isOriginal(ui)).toBe(true)
+  await ui.unmount()
 })

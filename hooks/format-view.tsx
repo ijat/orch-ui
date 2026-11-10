@@ -1,14 +1,14 @@
 // The reply formatter's hooks and drawing. The pure core (routes, prompt, validation, pill kinds) is in
 // format.ts. Display only: the transcript text never changes, so raw is a redraw of the same message.
 import { atom, read, update } from 'claude-code'
-import type { ElementTable, EngineInterface, On, RenderChildren } from 'claude-code'
+import type { ElementTable, EngineInterface, On, RenderChildren, Timer } from 'claude-code'
 
-import type { Billing, FmtEntry, FmtLatest, FmtOrderItem, FmtStats, KeySource, Trigger } from '../types'
+import type { Billing, FmtEntry, FmtFrame, FmtLatest, FmtOrderItem, FmtStats, FmtTurn, KeySource, RouteKind, Trigger } from '../types'
 import { formatCall } from './format-call'
 import type { CallSeen } from './format-call'
 import {
   DEFAULT_BILLING, DEFAULT_EFFORT, DEFAULT_KEY_SOURCE, DEFAULT_MODEL, EFFORTS, KINDS, MODELS, PAUSE_REASONS, endsWithPartialMark, formatOnce, hidePartialMark,
-  kindOf, route, stripMark,
+  kindOf, route, startsWithPartialMark, stripMark,
 } from './format'
 import type { Kind, Part, Route, Row, RowTag } from './format'
 import { textKey } from './lib'
@@ -58,6 +58,16 @@ const fmtLatest = atom({ plugin: 'orch-ui', key: 'fmtLatest' } as const, null as
 // session a new id and fires no session.start, and the engine resets every atom with it: this flag goes back to false
 // with the settings, which is what asks for the next load.
 const fmtLoaded = atom({ plugin: 'orch-ui', key: 'fmtLoaded' } as const, false)
+// The main loop's turns: `n` counts the turns that started, `at` is the start time while one runs. Set at turn.start,
+// cleared at turn.complete of any reason, so a marked reply that streams in is told from an old one.
+const NO_TURN: FmtTurn = { n: 0, at: null }
+const fmtTurn = atom({ plugin: 'orch-ui', key: 'fmtTurn' } as const, NO_TURN)
+// The placeholder's animation: advanced by the one timer, read only by a row that draws the placeholder.
+const START_FRAME: FmtFrame = { i: 0, now: 0 }
+const fmtFrame = atom({ plugin: 'orch-ui', key: 'fmtFrame' } as const, START_FRAME)
+// Conversions claimed and not yet ended, and whether the timer runs (the handle is `ticker`, below).
+const fmtPendingN = atom({ plugin: 'orch-ui', key: 'fmtPendingN' } as const, 0)
+const fmtTicking = atom({ plugin: 'orch-ui', key: 'fmtTicking' } as const, false)
 
 // One entry and one raw mark per message, by the key of its text.
 // The reference is written out in each call: the scan that lists what a module reads and writes needs literal
@@ -79,7 +89,6 @@ async function statsOf($: EngineInterface): Promise<FmtStats> {
 }
 
 const keyOf = (text: string) => textKey(text.trim())
-const PENDING: FmtEntry = { state: 'pending' }
 
 // -- conversion ------------------------------------------------------------------------------------
 
@@ -115,41 +124,131 @@ const BILLINGS = ['api', 'subscription'] as const
 const KEY_SOURCES = ['env', 'file'] as const
 const settingOf = <T extends string>(v: unknown, allowed: readonly T[], fallback: T): T => (allowed.includes(v as T) ? (v as T) : fallback)
 
+// -- the animation timer (D3) ------------------------------------------------------------------------
+// One `$.clock.every` timer advances the placeholder's frame. It runs only while something needs it: a conversion is
+// pending, or a turn runs in an orchestrator session with the option on (a marked reply streaming in is drawn as the
+// placeholder too). Every change of either calls syncTimer, which starts or cancels it.
+
+const TICK_MS = 100
+export const FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const
+// The handle of the running timer. The atom `fmtTicking` says whether one runs, and what a new session or a /clear resets.
+let ticker: Timer | null = null
+
+// Cancels the handle, if any; a handle of an engine that is gone may refuse.
+function stopTicker() {
+  try {
+    ticker?.cancel()
+  } catch {
+    // Nothing runs under it any more.
+  }
+  ticker = null
+}
+
+async function timerNeeded($: EngineInterface): Promise<boolean> {
+  if (((await read($, fmtPendingN)) ?? 0) > 0) return true
+  const turn = await read($, fmtTurn)
+  return turn?.at != null && (await read($, fmtOrch)) === true && (await read($, fmtOn)) === true
+}
+
+// Starts the timer when something needs it and none runs, cancels it when nothing does. Calls overlap (a conversion ends
+// as a turn starts), so after acting it looks again and goes on until the timer matches the need.
+async function syncTimer($: EngineInterface) {
+  for (let round = 0; round < 4; round++) {
+    const need = await timerNeeded($)
+    // read before the flip: the timer is made in the same step as the flip, so a stop in between finds it
+    const now = need ? await $.clock.now() : 0
+    let flipped = false
+    await update($, fmtTicking, cur => {
+      flipped = need !== (cur === true)
+      return need
+    })
+    if (flipped && !need) stopTicker()
+    if (flipped && need) {
+      ticker = $.clock.every(TICK_MS, () => void tick($).catch(() => undefined))
+      await update($, fmtFrame, () => ({ i: 0, now }))
+    }
+    if ((await timerNeeded($)) === need) return
+  }
+}
+
+// One period: the next frame and the time.
+async function tick($: EngineInterface) {
+  const now = await $.clock.now()
+  await update($, fmtFrame, f => ({ i: (f?.i ?? 0) + 1, now }))
+}
+
+async function startTurn($: EngineInterface) {
+  const at = await $.clock.now()
+  await update($, fmtTurn, t => ({ n: (t?.n ?? 0) + 1, at }))
+  await syncTimer($)
+}
+
+async function endTurn($: EngineInterface) {
+  await update($, fmtTurn, t => ({ n: t?.n ?? 0, at: null }))
+  await syncTimer($)
+}
+
+// Takes the claim on a text's entry: pending, with the time. True when this call took it (no entry yet, or a retry of one
+// that ended as written); that call owes a pendingEnd.
+async function claimEntry($: EngineInterface, key: string, retry: boolean): Promise<boolean> {
+  const since = await $.clock.now()
+  let claimed = false
+  await changeEntry($, key, cur => {
+    // A request may take one more try at a reply whose first try ended as written.
+    claimed = cur === undefined || (retry && cur.state === 'kept')
+    return claimed ? { state: 'pending', since } : (cur as FmtEntry)
+  })
+  if (claimed) {
+    await update($, fmtPendingN, n => (n ?? 0) + 1)
+    await syncTimer($)
+  }
+  return claimed
+}
+
+async function pendingEnd($: EngineInterface, key: string, kind: RouteKind) {
+  // Whatever ended the conversion, the entry is never left pending: a run that threw ends as written.
+  await changeEntry($, key, cur => (cur?.state === 'pending' ? { state: 'kept', kind, reason: 'error' } : (cur as FmtEntry)))
+  await update($, fmtPendingN, n => Math.max(0, (n ?? 0) - 1))
+  await syncTimer($)
+}
+
 // Asks for the rewrite of one reply (one `claude -p` call) and records the outcome. Anything that is not a valid
-// rewrite leaves the original on screen and records why.
-async function convert($: EngineInterface, text: string, seq: number, retry = false) {
+// rewrite leaves the original on screen and records why. `claimed` comes from a caller that took the claim already (the
+// turn's end does, so the placeholder never gives way to the plain text in between); without it the claim is taken here.
+async function convert($: EngineInterface, text: string, seq: number, retry = false, claimed?: boolean) {
   const source = text.trim()
   const r = route(source)
   if (!r) return
   const key = keyOf(source)
 
-  // Raw for the session, a switched-off option or a pause may have come in since the turn ended.
-  if ((await read($, fmtRaw)) || !(await read($, fmtOn)) || (await read($, fmtPause)) != null) return
-  let claimed = false
-  await changeEntry($, key, cur => {
-    // A request may take one more try at a reply whose first try ended as written.
-    claimed = cur === undefined || (retry && cur.state === 'kept')
-    return claimed ? PENDING : (cur as FmtEntry)
-  })
+  if (claimed === undefined) {
+    // Raw for the session, a switched-off option or a pause may have come in since the turn ended.
+    if ((await read($, fmtRaw)) || !(await read($, fmtOn)) || (await read($, fmtPause)) != null) return
+    claimed = await claimEntry($, key, retry)
+  }
   if (!claimed) {
     // The same text again: its entry stands, and it becomes the newest message.
     if ((await readEntry($, key))?.state === 'done') await enqueue($, key, seq)
     return
   }
 
-  const model = settingOf(await read($, fmtModel), MODELS, DEFAULT_MODEL)
-  const effort = settingOf(await read($, fmtEffort), EFFORTS, DEFAULT_EFFORT)
-  const billing = settingOf(await read($, fmtBilling), BILLINGS, DEFAULT_BILLING)
-  const keySource = settingOf(await read($, fmtKey), KEY_SOURCES, DEFAULT_KEY_SOURCE)
-  let ran: CallSeen | null = null
-  const res = await formatOnce(source, { model, effort, kind: r.kind }, req =>
-    formatCall($, req, { billing, keySource }, { seen: info => { ran = info } }))
-  if (!res.ok) {
-    if ((PAUSE_REASONS as readonly string[]).includes(res.reason)) await update($, fmtPause, () => res.reason)
-    await record($, key, { state: 'kept', kind: r.kind, reason: res.reason }, seq, { r, model, retry, billing }, res.reason, res.costUsd, ran, res.paidBy)
-    return
+  try {
+    const model = settingOf(await read($, fmtModel), MODELS, DEFAULT_MODEL)
+    const effort = settingOf(await read($, fmtEffort), EFFORTS, DEFAULT_EFFORT)
+    const billing = settingOf(await read($, fmtBilling), BILLINGS, DEFAULT_BILLING)
+    const keySource = settingOf(await read($, fmtKey), KEY_SOURCES, DEFAULT_KEY_SOURCE)
+    let ran: CallSeen | null = null
+    const res = await formatOnce(source, { model, effort, kind: r.kind }, req =>
+      formatCall($, req, { billing, keySource }, { seen: info => { ran = info } }))
+    if (!res.ok) {
+      if ((PAUSE_REASONS as readonly string[]).includes(res.reason)) await update($, fmtPause, () => res.reason)
+      await record($, key, { state: 'kept', kind: r.kind, reason: res.reason }, seq, { r, model, retry, billing }, res.reason, res.costUsd, ran, res.paidBy)
+      return
+    }
+    await record($, key, { state: 'done', kind: r.kind, parts: res.parts }, seq, { r, model, retry, billing }, 'ok', res.costUsd, ran)
+  } finally {
+    await pendingEnd($, key, r.kind)
   }
-  await record($, key, { state: 'done', kind: r.kind, parts: res.parts }, seq, { r, model, retry, billing }, 'ok', res.costUsd, ran)
 }
 
 // -- raw -------------------------------------------------------------------------------------------
@@ -180,6 +279,12 @@ async function resetSession($: EngineInterface) {
   await update($, fmtStats, () => EMPTY_STATS)
   await update($, fmtLatest, () => null)
   await update($, fmtLoaded, () => false)
+  // No turn, no pending conversion and no timer: a conversion still running ends against a count of zero.
+  stopTicker()
+  await update($, fmtTicking, () => false)
+  await update($, fmtPendingN, () => 0)
+  await update($, fmtTurn, () => NO_TURN)
+  await update($, fmtFrame, () => START_FRAME)
 }
 
 // "Format that": converts the session's latest eligible reply when it was left as written. Only that reply; an older
@@ -492,6 +597,21 @@ const IS_HEX = new RegExp(`^${HEX}$`)
 const TOKEN = new RegExp('(`[^`]+`|\\*\\*[^*]+\\*\\*|\\b' + HEX + '\\b)', 'g')
 const NOT_INLINE = /\[[^\]]+\]\(|^\s*(#|>|\d+\.\s|```|~~~|\|)|(^|[^*])\*[^*\s][^*]*\*([^*]|$)/m
 
+// The rounded page a formatted reply sits on, and the placeholder before it.
+const PAGE = { flexDirection: 'column', borderStyle: 'round', borderColor: 'inactive', paddingX: 2, paddingY: 1 } as const
+
+// The placeholder of a reply that is being formatted: the same page, one line with the spinner and the whole seconds
+// since the work began (`since`, or the start of the turn while the reply still streams in).
+export function drawPlaceholder(el: ElementTable<'terminal'>, frame: FmtFrame, since: number | undefined) {
+  const { Box, Text } = el
+  const secs = since === undefined || frame.now < since ? 0 : Math.floor((frame.now - since) / 1000)
+  return (
+    <Box {...PAGE}>
+      <Text color="inactive">{`${FRAMES[(frame.i ?? 0) % FRAMES.length]} formatting reply · ${secs}s`}</Text>
+    </Box>
+  )
+}
+
 // The tree of a rewritten reply: a banner, then titled sections and at most one panel.
 export function drawParts(el: ElementTable<'terminal'>, parts: readonly Part[]) {
   const { Box, Text, Markdown } = el
@@ -535,7 +655,7 @@ export function drawParts(el: ElementTable<'terminal'>, parts: readonly Part[]) 
 
   // The whole formatted reply sits on one rounded page, so it reads as a redraw, not as the model's text.
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor="inactive" paddingX={2} paddingY={1}>
+    <Box {...PAGE}>
       {parts.map((p, i) => {
         if (p.kind === 'banner') {
           return (
@@ -583,6 +703,20 @@ export function drawParts(el: ElementTable<'terminal'>, parts: readonly Part[]) 
 
 // -- hooks -------------------------------------------------------------------------------------------
 
+// The number of the turn each message first drew in (0: drawn while no turn ran), by its id. A row that streams in is
+// born in the running turn; an old one is not. Module state, not an atom: a render cannot write one.
+const BORN_MAX = 4000
+const born = new Map<string, number>()
+function bornIn(id: string, turn: FmtTurn): number {
+  let n = born.get(id)
+  if (n === undefined) {
+    n = turn.at != null ? turn.n : 0
+    born.set(id, n)
+    if (born.size > BORN_MAX) born.delete(born.keys().next().value as string)
+  }
+  return n
+}
+
 export function registerFormat(on: On) {
   // The orchestrator session is the one where the orchestrate skill loaded. After a restart nothing is
   // formatted until it loads again; the resume flow loads it.
@@ -593,8 +727,24 @@ export function registerFormat(on: On) {
     if ((await read($, fmtOrch)) !== true) {
       await update($, fmtOrch, () => true)
       await registerTool($)
+      // The turn that loaded the skill may be the one that streams a marked reply.
+      await syncTimer($)
     }
     return out
+  })
+
+  // The main loop's turn runs from here to its turn.complete: a marked reply that streams in is drawn as the placeholder.
+  on('turn.start', async ($, e, next) => {
+    const out = await next(e)
+    if (e.agentId === undefined) await startTurn($).catch(() => undefined)
+    return out
+  })
+
+  // A turn that ends without an answer (interrupted, refused, failed) only ends the turn.
+  on('turn.complete', { reason: ['aborted', 'refusal', 'error'] }, async ($, e, next) => {
+    const done = await next(e)
+    if (e.agentId === undefined) await endTurn($).catch(() => undefined)
+    return done
   })
 
   // A /clear ends the conversation without a new session.start: forget this session's state, keep the option.
@@ -606,22 +756,29 @@ export function registerFormat(on: On) {
   // The main loop's finished reply. The work starts on a timer so this hook returns at once.
   on('turn.complete', { reason: 'answer' }, async ($, e, next) => {
     const done = await next(e)
-    if (e.agentId !== undefined || (await read($, fmtOrch)) !== true) return done
-    // The marker is not part of the reply: it is stripped first, and the key, the route and the source all come from the rest.
-    const { marked, text } = stripMark(e.answer)
-    if (route(text) === null) return done
-    const seq = await update($, fmtSeq, n => (n ?? 0) + 1)
-    // Every eligible reply is the session's latest, whether it is converted or not.
-    await update($, fmtLatest, () => ({ key: keyOf(text), text, seq, retried: false }))
-    await update($, fmtStats, s => {
-      const cur = isStats(s) ? s : EMPTY_STATS
-      return { ...cur, eligible: cur.eligible + 1, marked: cur.marked + (marked ? 1 : 0) }
-    })
-    const trigger = settingOf(await read($, fmtTrigger), TRIGGERS, DEFAULT_TRIGGER)
-    if ((trigger === 'auto' || marked) && (await read($, fmtOn)) === true && (await read($, fmtRaw)) !== true && (await read($, fmtPause)) == null) {
-      $.clock.after(0, () => void convert($, text, seq).catch(() => undefined))
+    if (e.agentId !== undefined) return done
+    try {
+      if ((await read($, fmtOrch)) !== true) return done
+      // The marker is not part of the reply: it is stripped first, and the key, the route and the source all come from the rest.
+      const { marked, text } = stripMark(e.answer)
+      if (route(text) === null) return done
+      const seq = await update($, fmtSeq, n => (n ?? 0) + 1)
+      // Every eligible reply is the session's latest, whether it is converted or not.
+      await update($, fmtLatest, () => ({ key: keyOf(text), text, seq, retried: false }))
+      await update($, fmtStats, s => {
+        const cur = isStats(s) ? s : EMPTY_STATS
+        return { ...cur, eligible: cur.eligible + 1, marked: cur.marked + (marked ? 1 : 0) }
+      })
+      const trigger = settingOf(await read($, fmtTrigger), TRIGGERS, DEFAULT_TRIGGER)
+      if ((trigger === 'auto' || marked) && (await read($, fmtOn)) === true && (await read($, fmtRaw)) !== true && (await read($, fmtPause)) == null) {
+        // The claim is taken here, before the turn is marked as ended, so the row goes from the streaming placeholder to the pending one with no plain text between.
+        const claimed = await claimEntry($, keyOf(text), false)
+        $.clock.after(0, () => void convert($, text, seq, false, claimed).catch(() => undefined))
+      }
+      return done
+    } finally {
+      await endTurn($).catch(() => undefined)
     }
-    return done
   })
 
   on('tool.call', { tool: FORMAT_TOOL_FULL }, async ($, e) => setFormat($, e as unknown as Record<string, unknown>))
@@ -639,7 +796,29 @@ export function registerFormat(on: On) {
     const key = keyOf(text)
     if ((await readMark($, key)) === true) return asIs()
     const entry = await readEntry($, key)
-    if (entry?.state !== 'done') return asIs()
-    return drawParts($.ui.resolve(e), entry.parts)
+    const el = $.ui.resolve(e)
+    if (entry?.state === 'done') return drawParts(el, entry.parts)
+    // Only a marked reply (or the first characters of one) gets the placeholder and the reason line; any other is as written.
+    if (!marked && !startsWithPartialMark(original)) return asIs()
+    // The original text, and one dim line saying why it is not formatted.
+    const asWritten = async (reason: string) => {
+      const { Box, Text } = el
+      return (
+        <Box flexDirection="column">
+          {await asIs()}
+          <Text dimColor>{`orch-ui: shown as written (${reason})`}</Text>
+        </Box>
+      )
+    }
+    if (entry?.state === 'kept') return asWritten(entry.reason)
+    if (entry?.state === 'pending') return drawPlaceholder(el, await read($, fmtFrame), entry.since)
+    const pause = await read($, fmtPause)
+    if (pause != null) return asWritten(`paused: ${pause}`)
+    // No entry: still streaming when it began in the turn that runs now. A marked reply from an earlier turn, or from before
+    // this session, that never got an entry is as written; it must not spin.
+    const turn = await read($, fmtTurn)
+    const bornAt = bornIn(e.requestId, turn)
+    if (turn.at != null && bornAt === turn.n) return drawPlaceholder(el, await read($, fmtFrame), turn.at)
+    return asIs()
   })
 }
