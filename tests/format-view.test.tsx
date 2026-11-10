@@ -2435,7 +2435,8 @@ test('a one-flush marked reply, and several text blocks of one turn, each get th
   const rowA = await show($, single.displayContent!)
   const rowC = await show($, other.row)
   expect(await texts(rowA)).toEqual([spin(0, 0)])
-  expect(await texts(rowC)).toEqual([spin(0, 0)])
+  // the second block is complete and too short to convert: as written
+  expect(await isOriginal(rowC)).toBe(true)
   await rowA.unmount()
   await rowC.unmount()
 })
@@ -2579,11 +2580,55 @@ test('a hidden reply that is not eligible for the model (short) is as written on
   const short = `${MARK}\nAll done, nothing to decide.`
   const { row } = await streamReply($, 'sh-1', short)
   const ui = await show($, row)
-  expect(await texts(ui)).toEqual([spin(0, 0)])
+  // the block is complete (its final flush ran) and too short to convert: as written at once, while the turn still runs
+  expect(await isOriginal(ui)).toBe(true)
   await finish($, b, short)
   expect(b.w.calls).toEqual([])
   expect(rowsOf(b)).toEqual(['All done, nothing to decide.'])
   await ui.unmount()
+})
+
+test('a short marked block before a slow tool call is as written right after its final flush, not when the turn ends', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  await orchestrate($)
+  await startTurn($, b)
+  const short = `${MARK}\nAll done, nothing to decide.`
+  const { row } = await streamReply($, 'sh-2', short)
+  const ui = await show($, row)
+  // the tool call: the turn runs on with no reply text; the block does not spin and does not wait for turn.complete
+  await b.clock.advance(5000)
+  expect(await isOriginal(ui)).toBe(true)
+  expect((await texts(ui)).join('\n')).not.toContain('formatting reply')
+  expect(b.w.calls).toEqual([])
+  await endTurn($, b, 'aborted')
+  expect(await isOriginal(ui)).toBe(true)
+  await ui.unmount()
+})
+
+test('a final flush that arrives before an earlier one is not a complete original: nothing is converted', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  await orchestrate($)
+  await startTurn($, b)
+  const flushes = flushesOf('oo-1', REPLY, 3)
+  expect(flushes.length).toBeGreaterThan(2)
+  // flush 0 hides the reply; the final one comes before the ones between
+  await flushOf($, flushes[0]!)
+  await flushOf($, flushes[flushes.length - 1]!)
+  await b.clock.advance(200)
+  expect(b.w.calls).toEqual([])
+  await endTurn($, b, 'aborted')
+  expect(b.w.calls).toEqual([])
+})
+
+test('two calls that start the timer together make one timer, and it is cancelled when the turn ends', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  await orchestrate($)
+  await Promise.all([$.turn.start({ text: 'go', turnId: 'x1' } as never), $.turn.start({ text: 'go', turnId: 'x2' } as never)])
+  await b.clock.settle()
+  expect(await quiet(b, 1000)).toBeLessThanOrEqual(10)
+  await endTurn($, b, 'aborted')
+  expect(await quiet(b, 3000)).toBe(0)
 })
 
 test('a turn that ends without its last flush shows what was received as written', async ($, on) => {

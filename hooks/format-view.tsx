@@ -66,7 +66,7 @@ const fmtTurn = atom({ plugin: 'orch-ui', key: 'fmtTurn' } as const, NO_TURN)
 // The placeholder's animation: advanced by the one timer, read only by a row that draws the placeholder.
 const START_FRAME: FmtFrame = { i: 0, now: 0 }
 const fmtFrame = atom({ plugin: 'orch-ui', key: 'fmtFrame' } as const, START_FRAME)
-// Conversions claimed and not yet ended, and whether the timer runs (the handle is `ticker`, below).
+// Conversions claimed and not yet ended, and whether the timer runs (a mirror of the handle `ticker`, below).
 const fmtPendingN = atom({ plugin: 'orch-ui', key: 'fmtPendingN' } as const, 0)
 const fmtTicking = atom({ plugin: 'orch-ui', key: 'fmtTicking' } as const, false)
 // Counts the changes to `held` (below), so a row that read it is drawn again when a hidden reply is complete.
@@ -135,7 +135,7 @@ const settingOf = <T extends string>(v: unknown, allowed: readonly T[], fallback
 
 const TICK_MS = 100
 export const FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const
-// The handle of the running timer. The atom `fmtTicking` says whether one runs, and what a new session or a /clear resets.
+// The handle of the running timer: at most one, and the one thing that says whether it runs. A /clear cancels it.
 let ticker: Timer | null = null
 
 // Cancels the handle, if any; a handle of an engine that is gone may refuse.
@@ -155,22 +155,22 @@ async function timerNeeded($: EngineInterface): Promise<boolean> {
 }
 
 // Starts the timer when something needs it and none runs, cancels it when nothing does. Calls overlap (a conversion ends
-// as a turn starts), so after acting it looks again and goes on until the timer matches the need.
+// as a turn starts), so after acting it looks again and goes on until the timer matches the need. The handle is the
+// truth: it is looked at and made or cancelled with no await between, so two calls cannot make two timers. The atom
+// `fmtTicking` only mirrors it.
 async function syncTimer($: EngineInterface) {
   for (let round = 0; round < 4; round++) {
     const need = await timerNeeded($)
-    // read before the flip: the timer is made in the same step as the flip, so a stop in between finds it
     const now = need ? await $.clock.now() : 0
-    let flipped = false
-    await update($, fmtTicking, cur => {
-      flipped = need !== (cur === true)
-      return need
-    })
-    if (flipped && !need) stopTicker()
-    if (flipped && need) {
+    let started = false
+    if (need && !ticker) {
       ticker = $.clock.every(TICK_MS, () => void tick($).catch(() => undefined))
-      await update($, fmtFrame, () => ({ i: 0, now }))
+      started = true
+    } else if (!need) {
+      stopTicker()
     }
+    await update($, fmtTicking, () => ticker !== null)
+    if (started) await update($, fmtFrame, () => ({ i: 0, now }))
     if ((await timerNeeded($)) === need) return
   }
 }
@@ -916,7 +916,12 @@ async function verdictOf($: EngineInterface, m: Stream): Promise<boolean> {
 }
 
 const deltaText = (m: Stream) => m.deltas.join('')
-const isComplete = (m: Stream, last: number) => m.deltas.length === last + 1 && m.deltas.every(d => d !== undefined)
+// `every` skips the holes of a sparse array, so each index up to the final one is looked at.
+const isComplete = (m: Stream, last: number) => {
+  if (m.deltas.length !== last + 1) return false
+  for (let i = 0; i <= last; i++) if (typeof m.deltas[i] !== 'string') return false
+  return true
+}
 
 // Claims and starts the conversion of a hidden block whose original is complete. The turn's end converts the answer too,
 // but finds the claim taken and does nothing (one key, one conversion). Nothing here may fail a flush.
@@ -1129,6 +1134,9 @@ export function registerFormat(on: On) {
     if (entry?.state === 'pending') return drawPlaceholder(el, await read($, fmtFrame), begun ?? entry.since)
     const pause = await read($, fmtPause)
     if (pause != null) return asWritten(`paused: ${pause}`)
+    // A hidden block whose text is complete but too short or long to convert gets no claim: it is as written now, not
+    // when the turn ends.
+    if (tag !== null && route(text) === null) return asIs()
     // No entry: still streaming when it began in the turn that runs now. A marked reply from an earlier turn, or from before
     // this session, that never got an entry is as written; it must not spin.
     const turn = await read($, fmtTurn)
