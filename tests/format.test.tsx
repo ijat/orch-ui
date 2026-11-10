@@ -3,7 +3,7 @@ import { expect, test } from 'claude-code/testing'
 import {
   DEFAULT_BILLING, DEFAULT_EFFORT, DEFAULT_KEY_SOURCE, DEFAULT_MODEL, EFFORTS, FORMAT_SYSTEM, KINDS, LIMITS, MODELS, PAUSE_REASONS,
   MARK, cliArgs, cliEnv, contrast, eligible, endsWithPartialMark, formatOnce, hidePartialMark, identifiers, keyFileAclFree, keyFileModeOk, keyFileNeedsAclCheck, kindOf, limits, parseKeyFile, route,
-  stripMark, validate, verifyRun,
+  TAG_EDGE, TAG_ONE, TAG_ZERO, startsWithMark, startsWithPartialMark, stripMark, stripTag, tagOf, untag, validate, verifyRun,
 } from '../hooks/format'
 import type { CallOutcome, CallRequest } from '../hooks/format'
 import * as cli from './fixtures/format/cli'
@@ -633,7 +633,7 @@ test('MARK is the one comment line', () => {
   expect(MARK).toBe('<!-- orch-ui -->')
 })
 
-test('stripMark: marked only when the last non-blank line is the marker, and then it and the blank lines before it go', () => {
+test('stripMark: marked when the first or the last non-blank line is the marker; it goes with the blank lines next to it', () => {
   const cases: [string, string, boolean, string][] = [
     ['the last line', `body\n${MARK}`, true, 'body'],
     ['a final newline', `body\n${MARK}\n`, true, 'body'],
@@ -646,10 +646,17 @@ test('stripMark: marked only when the last non-blank line is the marker, and the
     ['only the marker', MARK, true, ''],
     ['the marker and blanks', `\n\n${MARK}\n`, true, ''],
     ['mid-text', `one\n${MARK}\ntwo`, false, `one\n${MARK}\ntwo`],
-    ['the first line only', `${MARK}\nbody`, false, `${MARK}\nbody`],
     ['inline at the end of a line', `body ${MARK}`, false, `body ${MARK}`],
     ['inline before text', `${MARK} body`, false, `${MARK} body`],
-    ['twice: the last is stripped, the first stays', `${MARK}\nbody\n${MARK}`, true, `${MARK}\nbody`],
+    ['the first line', `${MARK}\nbody`, true, 'body'],
+    ['the first line, blank lines after it', `${MARK}\n\n\nbody\nmore`, true, 'body\nmore'],
+    ['the first line, blank lines before and spaces around it', `\n  \n  ${MARK}  \n\nbody`, true, 'body'],
+    ['the first line, trailing text keeps its newline', `${MARK}\nbody\n`, true, 'body\n'],
+    ['the first line and nothing else', `${MARK}\n`, true, ''],
+    ['the first line, then blanks', `${MARK}\n\n  \n`, true, ''],
+    ['both ends', `${MARK}\nbody\n\n${MARK}`, true, 'body'],
+    ['the first line, a marker mid-text stays', `${MARK}\none\n${MARK}\ntwo`, true, `one\n${MARK}\ntwo`],
+    ['the first line is another comment', `<!-- other -->\n${MARK}\nbody`, false, `<!-- other -->\n${MARK}\nbody`],
     ['a different comment', 'body\n<!-- other -->', false, 'body\n<!-- other -->'],
     ['a case change', 'body\n<!-- ORCH-UI -->', false, 'body\n<!-- ORCH-UI -->'],
     ['no marker', 'body', false, 'body'],
@@ -677,8 +684,64 @@ test('endsWithPartialMark: the last line is the start of the marker, 4 character
   for (const [name, text, want] of cases) expect([name, endsWithPartialMark(text)]).toEqual([name, want])
 })
 
+test('startsWithPartialMark: the whole text so far is a shorter start of the marker', () => {
+  const cases: [string, string, boolean][] = [
+    ['one character', '<', true],
+    ['three', '<!-', true],
+    ['most of it', MARK.slice(0, -1), true],
+    ['leading blanks', `\n  ${MARK.slice(0, 6)}`, true],
+    ['all of it (that is a marker, not a start)', MARK, false],
+    ['a mismatch', '<!-- orch-uj', false],
+    ['text before it', 'body\n<!-- or', false],
+    ['text after it', '<!-- or\nbody', false],
+    ['a final newline', '<!-- or\n', false],
+    ['empty', '', false],
+    ['blank', ' \n ', false],
+    ['plain text', 'Plain reply', false],
+  ]
+  for (const [name, text, want] of cases) expect([name, startsWithPartialMark(text)]).toEqual([name, want])
+})
+
 test('hidePartialMark: drops the last line and the blank lines before it', () => {
   expect(hidePartialMark('body\n\n<!-- or')).toBe('body')
   expect(hidePartialMark('one\ntwo\n<!--')).toBe('one\ntwo')
   expect(hidePartialMark('<!-- or')).toBe('')
+})
+
+test('startsWithMark: the first non-blank line, trimmed, is the marker', () => {
+  const cases: [string, string, boolean][] = [
+    ['the marker alone', MARK, true],
+    ['the marker and its newline', `${MARK}\n`, true],
+    ['the marker with the text after it', `${MARK}\n\nThe migration needs`, true],
+    ['blank lines before it', `\n \n${MARK}\nbody`, true],
+    ['padding around it', `  ${MARK}  \nbody`, true],
+    ['the last line (the old place)', `body\n\n${MARK}`, false],
+    ['text on the marker line', `${MARK} body`, false],
+    ['a start of it', '<!-- orch', false],
+    ['empty', '', false],
+  ]
+  for (const [name, text, want] of cases) expect([name, startsWithMark(text)]).toEqual([name, want])
+})
+
+test('the tag: 8 hex characters as 32 zero-width characters between two joiners, read back and stripped', () => {
+  // the set is fixed here
+  expect([TAG_ZERO, TAG_ONE, TAG_EDGE]).toEqual(['\u200b', '\u200c', '\u2060'])
+  for (const id of ['00000000', 'ffffffff', 'e591a0b7', '0123abcd']) {
+    const tag = tagOf(id)
+    expect(tag).toHaveLength(34)
+    // nothing but the three characters, so nothing visible
+    expect([...tag].every(c => [TAG_ZERO, TAG_ONE, TAG_EDGE].includes(c))).toBe(true)
+    expect(untag(`⠋ formatting reply${tag}`)).toBe(id)
+    expect(untag(`⠋ formatting reply${tag} . . .`)).toBe(id)
+    expect(stripTag(`⠋ formatting reply${tag} . . .`)).toBe('⠋ formatting reply . . .')
+  }
+  expect(tagOf('00000000')).toBe(TAG_EDGE + TAG_ZERO.repeat(32) + TAG_EDGE)
+  expect(tagOf('ffffffff')).toBe(TAG_EDGE + TAG_ONE.repeat(32) + TAG_EDGE)
+  // a text without a whole tag has none: not one, a short one, an unframed run
+  for (const text of ['plain', '', `${TAG_EDGE}${TAG_ZERO.repeat(31)}${TAG_EDGE}`, TAG_ZERO.repeat(32), `${TAG_EDGE}${TAG_ZERO.repeat(33)}${TAG_EDGE}`]) {
+    expect([text, untag(text)]).toEqual([text, null])
+    expect(stripTag(text)).toBe(text)
+  }
+  expect(() => tagOf('xyz')).toThrow()
+  expect(() => tagOf('E591A0B7')).toThrow()
 })
