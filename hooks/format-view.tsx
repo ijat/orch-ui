@@ -10,33 +10,33 @@ import { textKey } from './lib'
 
 const SKILL = 'orchestrate'
 export const FORMAT_TOOL = 'set_message_format'
-export const FORMAT_TOOL_FULL = `mcp__orch-pane__${FORMAT_TOOL}`
+export const FORMAT_TOOL_FULL = 'mcp__orch-ui__set_message_format'
 const OPT_KEY = 'opt:format'
 
 // -- state -----------------------------------------------------------------------------------------
 // The option (also kept in $.store) and what one session knows. Nothing but the option outlives the session.
 
-const fmtOn = atom({ plugin: 'orch-pane', key: 'fmtOn' } as const, false)
+const fmtOn = atom({ plugin: 'orch-ui', key: 'fmtOn' } as const, false)
 // True once the orchestrate skill has loaded in this session; /clear resets it.
-const fmtOrch = atom({ plugin: 'orch-pane', key: 'fmtOrch' } as const, false)
+const fmtOrch = atom({ plugin: 'orch-ui', key: 'fmtOrch' } as const, false)
 // Raw for the whole session: every row as written, no new conversion.
-const fmtRaw = atom({ plugin: 'orch-pane', key: 'fmtRaw' } as const, false)
+const fmtRaw = atom({ plugin: 'orch-ui', key: 'fmtRaw' } as const, false)
 // Counts turns that started a conversion, so the list below keeps turn.complete order, not completion order.
-const fmtSeq = atom({ plugin: 'orch-pane', key: 'fmtSeq' } as const, 0)
+const fmtSeq = atom({ plugin: 'orch-ui', key: 'fmtSeq' } as const, 0)
 const EMPTY_ORDER: FmtOrderItem[] = []
 // The keys that received a valid entry, oldest turn first.
-const fmtOrder = atom({ plugin: 'orch-pane', key: 'fmtOrder' } as const, EMPTY_ORDER)
+const fmtOrder = atom({ plugin: 'orch-ui', key: 'fmtOrder' } as const, EMPTY_ORDER)
 const EMPTY_STATS: FmtStats = { formatted: 0, kept: 0, last: null }
-const fmtStats = atom({ plugin: 'orch-pane', key: 'fmtStats' } as const, EMPTY_STATS)
+const fmtStats = atom({ plugin: 'orch-ui', key: 'fmtStats' } as const, EMPTY_STATS)
 
 // One entry and one raw mark per message, by the key of its text.
 // The reference is written out in each call: the scan that lists what a module reads and writes needs literal
 // plugin and key, and only the id may be computed.
-const readEntry = ($: EngineInterface, id: string) => read($, { plugin: 'orch-pane', key: 'fmtEntries', id } as const)
+const readEntry = ($: EngineInterface, id: string) => read($, { plugin: 'orch-ui', key: 'fmtEntries', id } as const)
 const changeEntry = ($: EngineInterface, id: string, change: (cur: FmtEntry | undefined) => FmtEntry) =>
-  update($, { plugin: 'orch-pane', key: 'fmtEntries', id } as const, change)
-const readMark = ($: EngineInterface, id: string) => read($, { plugin: 'orch-pane', key: 'fmtMarks', id } as const)
-const setMark = ($: EngineInterface, id: string, value: boolean) => update($, { plugin: 'orch-pane', key: 'fmtMarks', id } as const, () => value)
+  update($, { plugin: 'orch-ui', key: 'fmtEntries', id } as const, change)
+const readMark = ($: EngineInterface, id: string) => read($, { plugin: 'orch-ui', key: 'fmtMarks', id } as const)
+const setMark = ($: EngineInterface, id: string, value: boolean) => update($, { plugin: 'orch-ui', key: 'fmtMarks', id } as const, () => value)
 
 // A stored value of another shape reads as the default.
 async function orderOf($: EngineInterface): Promise<FmtOrderItem[]> {
@@ -140,7 +140,7 @@ async function resetSession($: EngineInterface) {
   await update($, fmtStats, () => EMPTY_STATS)
 }
 
-const OFF_TEXT = "Formatting is off in orch-pane's options (Format replies); nothing changed."
+const OFF_TEXT = "Formatting is off in orch-ui's settings (/orch-ui); nothing changed."
 
 async function setFormat($: EngineInterface, e: Record<string, unknown>): Promise<{ result: string }> {
   const format = e.format
@@ -156,7 +156,7 @@ async function setFormat($: EngineInterface, e: Record<string, unknown>): Promis
   }
   if (scope === 'session') {
     await update($, fmtRaw, () => true)
-    return { result: 'Scope session: every message in this session is shown as written and no new message is formatted. The stored option in orch-pane is untouched. Formatting returns on request (format "formatted"), from the Format replies row in orch-pane\'s options, or in a new session.' }
+    return { result: 'Scope session: every message in this session is shown as written and no new message is formatted. The stored option in orch-ui is untouched. Formatting returns on request (format "formatted"), from the Format replies row in orch-ui\'s settings (/orch-ui), or in a new session.' }
   }
   const order = await orderOf($)
   const newest = order[order.length - 1]
@@ -166,7 +166,7 @@ async function setFormat($: EngineInterface, e: Record<string, unknown>): Promis
   return { result: 'Scope latest: the newest formatted message is now shown as written. The next message will be formatted again. The stored option is untouched.' }
 }
 
-const FORMAT_TOOL_DESCRIPTION = 'Show orch-pane\'s formatted redraw of your replies as written, or bring the formatting back. Call it only when the user explicitly asks about the formatting '
+const FORMAT_TOOL_DESCRIPTION = 'Show orch-ui\'s formatted redraw of your replies as written, or bring the formatting back. Call it only when the user explicitly asks about the formatting '
   + '(for example "show raw", "give me unfiltered", "turn off orch-ui", "bring the formatting back"), never because something was unclear: "I don\'t get it" means explain better, not call this. '
   + 'format "raw" shows messages as written, "formatted" restores the formatting. scope "latest" (the default) affects only the newest formatted message, and the next message is formatted again; '
   + 'use it unless the user\'s words cover more than the last message. scope "session" for "turn off orch-ui", "stop formatting", "keep it raw", "for the rest of the session", "all messages". '
@@ -188,11 +188,11 @@ async function registerTool($: EngineInterface) {
       },
     })
   } catch {
-    // No tool this session; the options row still restores the formatting.
+    // No tool this session; the settings row still restores the formatting.
   }
 }
 
-// -- the options row ---------------------------------------------------------------------------------
+// -- the settings row ---------------------------------------------------------------------------------
 
 // Called from register.tsx's session.start: a second unmatched hook on that event is refused.
 export async function loadFormat($: EngineInterface) {

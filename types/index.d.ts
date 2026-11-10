@@ -21,7 +21,7 @@ export type FmtStats = { formatted: number; kept: number; last: { reason: string
 
 declare module 'claude-code' {
   interface PluginState {
-    'orch-pane': {
+    'orch-ui': {
       fmtOn: boolean
       fmtOrch: boolean
       fmtRaw: boolean

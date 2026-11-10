@@ -1,4 +1,4 @@
-// textKey, copied byte-identical from orch-pane hooks/lib.ts (b0c0f2e): plugins cannot import each other.
+// The one helper format-view.tsx needs; plugins cannot import each other, so it lives here.
 // cyrb53: a 53-bit string hash; a cache key, not a security use. The prefix names the prompt version.
 export function textKey(text: string): string {
   let h1 = 0xdeadbeef
