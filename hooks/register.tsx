@@ -1,6 +1,6 @@
 import type { Register } from 'claude-code'
 
-import { formatRow, loadFormat, pressFormat, registerFormat } from './format-view'
+import { formatRow, loadFormat, pressFormat, pressSetting, registerFormat, settingRows } from './format-view'
 
 const PANE = 'orch-ui'
 
@@ -24,6 +24,7 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const fmt = await formatRow($)
+    const settings = await settingRows($)
 
     const check = (key: string, on_: boolean, label: string, note: string | null, press: () => void) => (
       <Box flexDirection="column" marginBottom={1}>
@@ -34,9 +35,22 @@ export const register: Register = on => {
       </Box>
     )
 
+    // A row that cycles through values: the same Button and layout as check(), drawing `<label>: <value>`.
+    const choice = (key: string, label: string, value: string, note: string | null, press: () => void) => (
+      <Box flexDirection="column" marginBottom={1}>
+        <Box paddingLeft={4}>
+          <Button key={key} plain onPress={press}>
+            {label}: {value}
+          </Button>
+        </Box>
+        {note ? <Box paddingLeft={4}><Text dimColor>{note}</Text></Box> : null}
+      </Box>
+    )
+
     return (
       <Box flexDirection="column">
         {check('opt-format', fmt.on, 'Format replies', fmt.note, () => pressFormat($))}
+        {settings.map(row => choice(row.key, row.label, row.value, row.note, () => pressSetting($, row.id)))}
       </Box>
     )
   })

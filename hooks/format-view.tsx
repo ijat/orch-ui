@@ -310,6 +310,100 @@ export async function pressFormat($: EngineInterface) {
   }
 }
 
+// -- the settings rows (D30, D43) ---------------------------------------------------------------------
+// Five rows under `Format replies` in the /orch-ui pane. Each press moves to the next value, stores it and lifts a
+// pause; the new value applies from the next call. Nothing here reads or shows key material or a gateway value.
+
+export type SettingId = 'trigger' | 'model' | 'effort' | 'billing' | 'key'
+export type SettingRow = { id: SettingId; key: string; label: string; value: string; note: string | null }
+
+const KEY_FILE_LABEL = '~/.claude/settings.local.json'
+// The last outcomes that say something about the credential, for the key row's note.
+const KEY_REASONS: readonly string[] = ['no-credential', 'auth-failed', 'base-url-set', 'key-file-missing', 'key-file-unsafe', 'key-file-invalid']
+
+async function settingsNow($: EngineInterface) {
+  return {
+    trigger: settingOf(await read($, fmtTrigger), TRIGGERS, DEFAULT_TRIGGER),
+    model: settingOf(await read($, fmtModel), MODELS, DEFAULT_MODEL),
+    effort: settingOf(await read($, fmtEffort), EFFORTS, DEFAULT_EFFORT),
+    billing: settingOf(await read($, fmtBilling), BILLINGS, DEFAULT_BILLING),
+    keySource: settingOf(await read($, fmtKey), KEY_SOURCES, DEFAULT_KEY_SOURCE),
+  }
+}
+
+// What the rows show, in the pane's order. The key row is there only while billing is `api`.
+export async function settingRows($: EngineInterface): Promise<SettingRow[]> {
+  const s = await settingsNow($)
+  const lastReason = (await statsOf($)).last?.reason
+  const keyBits = [s.keySource === 'env' ? 'from ANTHROPIC_API_KEY' : `from ${KEY_FILE_LABEL}`]
+  if (lastReason && KEY_REASONS.includes(lastReason)) keyBits.push(`last: ${lastReason}`)
+  const rows: SettingRow[] = [
+    { id: 'trigger', key: 'opt-format-trigger', label: 'Format trigger', value: s.trigger, note: s.trigger === 'marked' ? 'only replies the orchestrator marks' : 'every eligible reply' },
+    { id: 'model', key: 'opt-format-model', label: 'Format model', value: s.model, note: null },
+    { id: 'effort', key: 'opt-format-effort', label: 'Format effort', value: s.effort, note: null },
+    {
+      id: 'billing', key: 'opt-format-billing', label: 'Format billing', value: s.billing === 'api' ? 'API key' : 'subscription',
+      note: s.billing === 'api' ? "API key: billed to that key's account" : 'subscription: counts toward your plan',
+    },
+  ]
+  if (s.billing === 'api') {
+    rows.push({ id: 'key', key: 'opt-format-key', label: 'Format API key', value: s.keySource === 'env' ? 'ANTHROPIC_API_KEY' : KEY_FILE_LABEL, note: keyBits.join(' · ') })
+  }
+  return rows
+}
+
+const nextOf = <T extends string>(all: readonly T[], cur: T): T => all[(all.indexOf(cur) + 1) % all.length] as T
+
+// One press: lifts a pause, moves the setting to its next value and stores it.
+export async function pressSetting($: EngineInterface, id: SettingId) {
+  await clearPause($)
+  const s = await settingsNow($)
+  let storeKey: string
+  let value: string
+  switch (id) {
+    case 'trigger': {
+      const v = nextOf(TRIGGERS, s.trigger)
+      await update($, fmtTrigger, () => v)
+      storeKey = OPT_TRIGGER
+      value = v
+      break
+    }
+    case 'model': {
+      const v = nextOf(MODELS, s.model)
+      await update($, fmtModel, () => v)
+      storeKey = OPT_MODEL
+      value = v
+      break
+    }
+    case 'effort': {
+      const v = nextOf(EFFORTS, s.effort)
+      await update($, fmtEffort, () => v)
+      storeKey = OPT_EFFORT
+      value = v
+      break
+    }
+    case 'billing': {
+      const v = nextOf(BILLINGS, s.billing)
+      await update($, fmtBilling, () => v)
+      storeKey = OPT_BILLING
+      value = v
+      break
+    }
+    case 'key': {
+      const v = nextOf(KEY_SOURCES, s.keySource)
+      await update($, fmtKey, () => v)
+      storeKey = OPT_KEY_SOURCE
+      value = v
+      break
+    }
+  }
+  try {
+    await $.store.set(storeKey, value)
+  } catch {
+    // This session keeps it; the next one starts from the default.
+  }
+}
+
 // -- drawing -----------------------------------------------------------------------------------------
 
 type Block = { kind: 'text'; text: string } | { kind: 'item'; text: string }
