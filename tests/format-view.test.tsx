@@ -31,8 +31,8 @@ type World = {
   // the host environment the plugin can read, and the names it asked for
   env: Record<string, string>; envAsked: string[]
   // files by path (text and the `ls -ln` mode), what was stat-ed, read and written, every process.run argv, every ui.log message
-  files: Map<string, { text: string; mode: string }>; stats: string[]; reads: string[]; written: string[]; runs: string[][]; logs: string[]
-  cost: number; lsExit: number; truncated: boolean
+  files: Map<string, { text: string; mode: string; acl?: string[] }>; stats: string[]; reads: string[]; written: string[]; runs: string[][]; logs: string[]
+  cost: number; lsExit: number; aclExit: number; truncated: boolean
   // the text the engine itself was asked to draw (a row no hook redrew)
   engineRows: string[]
   // the description of each tool registered
@@ -47,7 +47,7 @@ async function boot($: Engine, on: On, seed: Record<string, unknown> = { 'opt:fo
   const clock = mock.clock(on, { now: Date.parse('2026-11-10T10:00Z') })
   const w: World = {
     calls: [], tools: [], commands: [], opened: [], store: new Map(Object.entries({ 'opt:format-trigger': 'auto', ...seed })), replies: new Map(), delays: new Map(),
-    env: { ...envVars }, envAsked: [], files: new Map(), stats: [], reads: [], written: [], runs: [], logs: [], cost: 0.0061, lsExit: 0, truncated: false, engineRows: [], descriptions: [],
+    env: { ...envVars }, envAsked: [], files: new Map(), stats: [], reads: [], written: [], runs: [], logs: [], cost: 0.0061, lsExit: 0, aclExit: 0, truncated: false, engineRows: [], descriptions: [],
   }
   on('ui.render', { component: 'AssistantMessage' }, async (_, e, next) => {
     w.engineRows.push(e.props.text)
@@ -91,7 +91,10 @@ async function boot($: Engine, on: On, seed: Record<string, unknown> = { 'opt:fo
     const noRun = { value: { exitCode: 1, stdout: '', stderr: 'no orch', isStdoutTruncated: false, isStderrTruncated: false } }
     if (e.argv[0] === 'ls') {
       const f = w.files.get(String(e.argv[e.argv.length - 1]))
-      return { value: { exitCode: w.lsExit, stdout: f ? `${f.mode}  1 501  20  ${f.text.length} Nov 10 10:00 ${e.argv[e.argv.length - 1]}\n` : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      const first = f ? `${f.mode}  1 501  20  ${f.text.length} Nov 10 10:00 ${e.argv[e.argv.length - 1]}\n` : ''
+      // `ls -led` (macOS) lists ACL entries on the lines after the file's own
+      if (e.argv.includes('-led')) return { value: { exitCode: w.aclExit, stdout: first + (f?.acl ?? []).map((l, i) => ` ${i}: ${l}\n`).join(''), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      return { value: { exitCode: w.lsExit, stdout: first, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
     if (e.argv[0] !== CLAUDE_BIN) return noRun
     const argv = [...e.argv]
@@ -824,8 +827,24 @@ test('key source env: the session\'s key and bearer are never read, passed, or s
   expect(all.includes(SESSION_KEY)).toBe(false)
   expect(all.includes(BEARER)).toBe(false)
   // the only environment names read are the cloud providers, the gateway, and the home folder
-  expect([...new Set(b.w.envAsked)].sort()).toEqual(['ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_USE_VERTEX', 'HOME', 'OS'])
+  expect([...new Set(b.w.envAsked)].sort()).toEqual(['ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_ANTHROPIC_AWS', 'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_USE_MANTLE', 'CLAUDE_CODE_USE_VERTEX', 'HOME', 'OS'])
   await ui.unmount()
+})
+
+test('key file: an extended attribute without an ACL passes after a second ls', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true, 'opt:format-key': 'file' })
+  b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw-------@' })
+  await convertOne($, b)
+  expect(claudeRuns(b)).toHaveLength(1)
+  expect(b.w.runs.filter(a => a[0] === 'ls')).toEqual([['ls', '-ln', '--', KEY_PATH], ['ls', '-led', '--', KEY_PATH]])
+})
+
+test('key file: a plain mode never asks for the second ls', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true, 'opt:format-key': 'file' })
+  b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw-------' })
+  await convertOne($, b)
+  expect(claudeRuns(b)).toHaveLength(1)
+  expect(b.w.runs.filter(a => a[0] === 'ls')).toEqual([['ls', '-ln', '--', KEY_PATH]])
 })
 
 const KEY_FAILS: [string, (b: Booted) => void, string][] = [
@@ -833,6 +852,8 @@ const KEY_FAILS: [string, (b: Booted) => void, string][] = [
   ['group-readable', b => b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw-r-----' }), 'key-file-unsafe'],
   ['other-readable', b => b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw----r--' }), 'key-file-unsafe'],
   ['an ACL', b => b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw-------+' }), 'key-file-unsafe'],
+  ['an ACL behind an extended attribute', b => b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw-------@', acl: ['group:everyone allow read'] }), 'key-file-unsafe'],
+  ['an extended attribute whose ACL check failed', b => { b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw-------@' }); b.w.aclExit = 1 }, 'key-file-unsafe'],
   ['a link', b => b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: 'lrwx------' }), 'key-file-unsafe'],
   ['a failed ls', b => { b.w.lsExit = 1 }, 'key-file-unsafe'],
   ['a file over 64 KiB', b => b.w.files.set(KEY_PATH, { text: KEY_FILE + ' '.repeat(65536), mode: '-rw-------' }), 'key-file-unsafe'],
@@ -898,7 +919,8 @@ test('gateway: an empty ANTHROPIC_BASE_URL acts as unset', async ($, on) => {
   expect(await noteOf($)).toBe('formatted 1 · as written 0 · last: ok (short/opus) · api $0.01')
 })
 
-for (const name of ['CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY']) {
+const CLOUD_FLAGS = ['CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_USE_ANTHROPIC_AWS', 'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD', 'CLAUDE_CODE_USE_MANTLE']
+for (const name of CLOUD_FLAGS) {
   test(`cloud providers: ${name} stops every run and pauses`, async ($, on) => {
     const b = await boot($, on, { 'opt:format': true }, { HOME: '/home/u', [name]: '1' })
     await convertOne($, b)

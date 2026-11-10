@@ -4,7 +4,7 @@
 import type { EngineInterface } from 'claude-code'
 
 import type { Billing, CallOutcome, CallReason, CallRequest, KeySource } from '../types'
-import { cliArgs, cliEnv, keyFileModeOk, limits, parseKeyFile, verifyRun } from './format'
+import { cliArgs, cliEnv, keyFileAclFree, keyFileModeOk, keyFileNeedsAclCheck, limits, parseKeyFile, verifyRun } from './format'
 
 // The settings one call needs, read by the caller from its atoms.
 export type CallSettings = { billing: Billing; keySource: KeySource }
@@ -50,6 +50,11 @@ async function readKeyFile($: EngineInterface): Promise<{ ok: true; key: string 
   try {
     const ls = await $.process.run(['ls', '-ln', '--', path], { timeoutMs: LS_TIMEOUT_MS })
     if (!keyFileModeOk(ls.stdout, ls.exitCode)) return { ok: false, reason: 'key-file-unsafe' }
+    // macOS prints `@` instead of `+` when the file has extended attributes, which hides an ACL: look again.
+    if (keyFileNeedsAclCheck(ls.stdout)) {
+      const acl = await $.process.run(['ls', '-led', '--', path], { timeoutMs: LS_TIMEOUT_MS })
+      if (!keyFileAclFree(acl.stdout, acl.exitCode)) return { ok: false, reason: 'key-file-unsafe' }
+    }
   } catch {
     return { ok: false, reason: 'key-file-unsafe' }
   }
@@ -66,10 +71,13 @@ async function readKeyFile($: EngineInterface): Promise<{ ok: true; key: string 
 // Runs one call and returns its checked outcome. Never throws.
 export async function formatCall($: EngineInterface, req: CallRequest, settings: CallSettings, opts: CallOptions = {}): Promise<CallOutcome> {
   try {
-    // 1. Cloud providers: "api" and "subscription" both mean Anthropic's own API (D27). The names are literals.
+    // 1. Cloud providers: "api" and "subscription" both mean Anthropic's own API (D27). The names are literals: the six third-party provider flags the CLI itself tests.
     if (await $.env.get('CLAUDE_CODE_USE_BEDROCK')) return fail('cloud-provider')
     if (await $.env.get('CLAUDE_CODE_USE_VERTEX')) return fail('cloud-provider')
     if (await $.env.get('CLAUDE_CODE_USE_FOUNDRY')) return fail('cloud-provider')
+    if (await $.env.get('CLAUDE_CODE_USE_ANTHROPIC_AWS')) return fail('cloud-provider')
+    if (await $.env.get('CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD')) return fail('cloud-provider')
+    if (await $.env.get('CLAUDE_CODE_USE_MANTLE')) return fail('cloud-provider')
 
     // 2. A gateway under the file key would receive the key, so that run does not start; the value is only
     // ever tested for non-empty (a URL can carry credentials).
