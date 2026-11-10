@@ -10,11 +10,7 @@ import { cliArgs, cliEnv, keyFileModeOk, limits, parseKeyFile, verifyRun } from 
 export type CallSettings = { billing: Billing; keySource: KeySource }
 // What the caller learns about the call beyond its outcome. Called once, after the checks that need no run.
 export type CallSeen = { billing: Billing; viaBaseUrl: boolean }
-export type CallOptions = {
-  seen?: (info: CallSeen) => void
-  // Only for tests that cannot move the engine's clock.
-  now?: () => Promise<number> | number
-}
+export type CallOptions = { seen?: (info: CallSeen) => void }
 
 const fail = (reason: CallReason): CallOutcome => ({ ok: false, reason, costUsd: 0 })
 
@@ -106,15 +102,14 @@ export async function formatCall($: EngineInterface, req: CallRequest, settings:
     if (cwd === null) return fail('workdir-failed')
 
     // 5. The run. A rejection is told apart by the elapsed time; its message is matched for ENOENT only.
-    const now = opts.now ?? (() => $.clock.now())
-    const t0 = await now()
+    const t0 = await $.clock.now()
     let ran
     try {
       ran = await $.process.run(['claude', ...argv], { cwd, env, stdin: req.prompt, timeoutMs: lim.timeoutMs })
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       if (/ENOENT|not found|no such file/i.test(message)) return fail('cli-missing')
-      return fail((await now()) - t0 >= lim.timeoutMs - TIMEOUT_SLACK_MS ? 'timeout' : 'cli-failed')
+      return fail((await $.clock.now()) - t0 >= lim.timeoutMs - TIMEOUT_SLACK_MS ? 'timeout' : 'cli-failed')
     }
 
     // 6. stderr is never read.
