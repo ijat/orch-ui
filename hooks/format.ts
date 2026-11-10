@@ -529,7 +529,9 @@ export function keyFileAclFree(stdout: string, exitCode: number): boolean {
 }
 
 // -- the marker ---------------------------------------------------------------------------------------
-// The orchestrator ends an important reply with this line (D33). The mod removes it wherever it draws.
+// The orchestrator starts an important reply with this line (D33, moved to the first line so the mod knows from
+// the first streamed characters); a marker on the last line, the old place, still counts. The mod removes it
+// wherever it draws.
 
 export const MARK = '<!-- orch-ui -->'
 
@@ -537,15 +539,34 @@ const lastContent = (lines: string[]): number => {
   for (let i = lines.length - 1; i >= 0; i--) if ((lines[i] ?? '').trim() !== '') return i
   return -1
 }
+const firstContent = (lines: string[]): number => lines.findIndex(l => l.trim() !== '')
 
-// A text with its marker line removed. Marked only when the last non-blank line, trimmed, is the marker; that line and
-// the blank lines before it go. A marker anywhere else stays in the text and does not count.
+// A text with its marker line removed. Marked when the first or the last non-blank line, trimmed, is the marker: that
+// line goes with the blank lines next to it (after the first-line marker, before the last-line one). A marker anywhere
+// else stays in the text and does not count.
 export function stripMark(text: string): { marked: boolean; text: string } {
-  const lines = String(text).split('\n')
+  let lines = String(text).split('\n')
+  let marked = false
+  const first = firstContent(lines)
+  if (first >= 0 && (lines[first] ?? '').trim() === MARK) {
+    marked = true
+    lines = lines.slice(first + 1)
+    const next = firstContent(lines)
+    lines = next < 0 ? [] : lines.slice(next)
+  }
   const at = lastContent(lines)
-  if (at < 0 || (lines[at] ?? '').trim() !== MARK) return { marked: false, text }
-  const keep = lastContent(lines.slice(0, at))
-  return { marked: true, text: lines.slice(0, keep + 1).join('\n') }
+  if (at >= 0 && (lines[at] ?? '').trim() === MARK) {
+    marked = true
+    lines = lines.slice(0, lastContent(lines.slice(0, at)) + 1)
+  }
+  return marked ? { marked, text: lines.join('\n') } : { marked: false, text }
+}
+
+// Whether the whole text so far is the start of a marker line: one line, a shorter prefix of the marker. Seen when a
+// reply that starts with the marker has streamed only its first characters.
+export function startsWithPartialMark(text: string): boolean {
+  const t = String(text).trimStart()
+  return t.length > 0 && t.length < MARK.length && MARK.startsWith(t)
 }
 
 // Whether the text ends in the start of a marker line: its last line (nothing after the final newline) is a
