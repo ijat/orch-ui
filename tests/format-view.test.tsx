@@ -1145,7 +1145,7 @@ for (const [name, setup, reason] of KEY_FAILS) {
 }
 
 test('key file: Windows never reads one', async ($, on) => {
-  const b = await boot($, on, { 'opt:format': true, 'opt:format-key': 'file' }, { OS: 'Windows_NT', USERPROFILE: 'C:\\Users\\u', HOME: '/home/u' })
+  const b = await boot($, on, { 'opt:format': true, 'opt:format-key': 'file' }, { OS: 'Windows_NT', USERPROFILE: 'C:\\home\\u', HOME: '/home/u' })
   b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw-------' })
   await convertOne($, b)
   expect(claudeRuns(b)).toEqual([])
@@ -1213,11 +1213,11 @@ test('working directory: under the home folder, never TMPDIR, TEMP or /tmp', asy
 })
 
 test('working directory: Windows uses USERPROFILE with forward slashes', async ($, on) => {
-  const b = await boot($, on, { 'opt:format': true }, { OS: 'Windows_NT', USERPROFILE: 'C:\\Users\\u' })
+  const b = await boot($, on, { 'opt:format': true }, { OS: 'Windows_NT', USERPROFILE: 'C:\\home\\u' })
   await convertOne($, b)
-  expect(lastCall(b).cwd).toBe('C:/Users/u/.claude/orch-ui-format')
+  expect(lastCall(b).cwd).toBe('C:/home/u/.claude/orch-ui-format')
   // the kit resolves a path that is not absolute on this host against the session folder, so only its tail is the plugin's
-  expect(b.w.written.map(w => w.slice(-'C:/Users/u/.claude/orch-ui-format/.keep'.length))).toEqual(['C:/Users/u/.claude/orch-ui-format/.keep'])
+  expect(b.w.written.map(w => w.slice(-'C:/home/u/.claude/orch-ui-format/.keep'.length))).toEqual(['C:/home/u/.claude/orch-ui-format/.keep'])
 })
 
 test('working directory: no home folder is workdir-failed, a pause, and no run', async ($, on) => {
