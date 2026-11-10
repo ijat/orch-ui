@@ -68,7 +68,8 @@ export type CallReason =
   | 'timeout'
 export type CallOutcome =
   | { ok: true; text: string; costUsd: number; durationMs: number; durationApiMs: number; outputTokens: number }
-  | { ok: false; reason: CallReason; costUsd: number }
+  // paidBy is set where the run's own report names who paid (billing-mismatch); otherwise the configured billing paid.
+  | { ok: false; reason: CallReason; costUsd: number; paidBy?: Billing }
 
 declare module 'claude-code' {
   interface PluginState {

@@ -89,10 +89,10 @@ const enqueue = ($: EngineInterface, key: string, seq: number) =>
 
 // Records one outcome: the entry, this session's counts and spend, and the last reason. `ran` is what the call
 // reported once it got as far as a run (its billing, and whether a gateway is set); without it the last stays.
-async function record($: EngineInterface, key: string, entry: FmtEntry, seq: number, a: { r: Route; model: string; retry: boolean; billing: Billing }, reason: string, costUsd: number, ran: CallSeen | null) {
+async function record($: EngineInterface, key: string, entry: FmtEntry, seq: number, a: { r: Route; model: string; retry: boolean; billing: Billing }, reason: string, costUsd: number, ran: CallSeen | null, paidBy?: Billing) {
   const ok = entry.state === 'done'
-  // The money goes to the billing that paid for this run; a call that never got as far as a run spent none.
-  const paid = ran ? ran.billing : a.billing
+  // The money goes to the billing that paid for this run: what the run reported (a billing-mismatch names its payer), else the configured one; a call that never got as far as a run spent none.
+  const paid = paidBy ?? (ran ? ran.billing : a.billing)
   if (ok) await enqueue($, key, seq)
   await changeEntry($, key, () => entry)
   await update($, fmtStats, s => {
@@ -146,7 +146,7 @@ async function convert($: EngineInterface, text: string, seq: number, retry = fa
     formatCall($, req, { billing, keySource }, { seen: info => { ran = info } }))
   if (!res.ok) {
     if ((PAUSE_REASONS as readonly string[]).includes(res.reason)) await update($, fmtPause, () => res.reason)
-    await record($, key, { state: 'kept', kind: r.kind, reason: res.reason }, seq, { r, model, retry, billing }, res.reason, res.costUsd, ran)
+    await record($, key, { state: 'kept', kind: r.kind, reason: res.reason }, seq, { r, model, retry, billing }, res.reason, res.costUsd, ran, res.paidBy)
     return
   }
   await record($, key, { state: 'done', kind: r.kind, parts: res.parts }, seq, { r, model, retry, billing }, 'ok', res.costUsd, ran)

@@ -404,7 +404,11 @@ test('verifyRun: apiKeySource must be the billing\'s own, absent included', () =
   // the mismatch is found before the error mapping: an api run that found no key is a mismatch
   expect(reason(run(cli.stream(cli.init('none'), cli.resultNoCredential()), { billing: 'api' }))).toBe('billing-mismatch')
   // and the spend is still reported
-  expect(run(cli.stream(cli.init('none'), cli.resultOk(okText)), { billing: 'api' })).toEqual({ ok: false, reason: 'billing-mismatch', costUsd: 0.0061 })
+  // and it names who paid by what the run reported, not by the setting: no key source is the plan, anything else a key
+  expect(run(cli.stream(cli.init('none'), cli.resultOk(okText)), { billing: 'api' })).toEqual({ ok: false, reason: 'billing-mismatch', costUsd: 0.0061, paidBy: 'subscription' })
+  expect(run(cli.stream(cli.init('ANTHROPIC_API_KEY'), cli.resultOk(okText)), { billing: 'subscription' })).toEqual({ ok: false, reason: 'billing-mismatch', costUsd: 0.0061, paidBy: 'api' })
+  expect(run(cli.stream({ ...cli.init('none'), apiKeySource: 5 }, cli.resultOk(okText)), { billing: 'subscription' })).toEqual({ ok: false, reason: 'billing-mismatch', costUsd: 0.0061, paidBy: 'api' })
+  expect(run(cli.stream(bare, cli.resultOk(okText)), { billing: 'api' })).toEqual({ ok: false, reason: 'billing-mismatch', costUsd: 0.0061, paidBy: 'api' })
 })
 
 test('verifyRun: error results map to a closed reason', () => {
@@ -486,6 +490,14 @@ test('formatOnce: a failed call keeps its reason and cost, with exactly one call
   expect(await formatOnce(done.source, { model: 'sonnet', effort: 'high', kind: 'long' }, s.call)).toEqual({ ok: false, reason: 'timeout', costUsd: 0.002 })
   expect(s.seen).toHaveLength(1)
   expect(s.seen[0]).toMatchObject({ model: 'sonnet', effort: 'high', kind: 'long' })
+})
+
+test('formatOnce: a failed call keeps the payer it named, and ignores any other value', async () => {
+  const mismatch = (paidBy: unknown): CallOutcome => ({ ok: false, reason: 'billing-mismatch', costUsd: 0.01, paidBy } as CallOutcome)
+  const go = (o: CallOutcome) => formatOnce(done.source, { model: 'opus', effort: 'low', kind: 'short' }, stub(o).call)
+  expect(await go(mismatch('api'))).toEqual({ ok: false, reason: 'billing-mismatch', costUsd: 0.01, paidBy: 'api' })
+  expect(await go(mismatch('subscription'))).toEqual({ ok: false, reason: 'billing-mismatch', costUsd: 0.01, paidBy: 'subscription' })
+  expect(await go(mismatch('oauth'))).toEqual({ ok: false, reason: 'billing-mismatch', costUsd: 0.01 })
 })
 
 test('formatOnce: a text that fails validation is a rejection with the validator reason and the call cost', async () => {
