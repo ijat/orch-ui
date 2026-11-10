@@ -1,10 +1,14 @@
 // The reply formatter's hooks and drawing. The pure core (routes, prompt, validation, pill kinds) is in
 // format.ts. Display only: the transcript text never changes, so raw is a redraw of the same message.
 import { atom, read, update } from 'claude-code'
-import type { ElementTable, EngineInterface, ModelEffort, On, RenderChildren } from 'claude-code'
+import type { ElementTable, EngineInterface, On, RenderChildren } from 'claude-code'
 
-import type { FmtEntry, FmtOrderItem, FmtStats } from '../types'
-import { FORMAT_SYSTEM, KINDS, kindOf, route, validate } from './format'
+import type { Billing, FmtEntry, FmtOrderItem, FmtStats, KeySource } from '../types'
+import { formatCall } from './format-call'
+import type { CallSeen } from './format-call'
+import {
+  DEFAULT_BILLING, DEFAULT_EFFORT, DEFAULT_KEY_SOURCE, DEFAULT_MODEL, EFFORTS, KINDS, MODELS, PAUSE_REASONS, formatOnce, kindOf, route,
+} from './format'
 import type { Kind, Part, Route, Row, RowTag } from './format'
 import { textKey } from './lib'
 
@@ -12,6 +16,10 @@ const SKILL = 'orchestrate'
 export const FORMAT_TOOL = 'set_message_format'
 export const FORMAT_TOOL_FULL = 'mcp__orch-ui__set_message_format'
 const OPT_KEY = 'opt:format'
+const OPT_MODEL = 'opt:format-model'
+const OPT_EFFORT = 'opt:format-effort'
+const OPT_BILLING = 'opt:format-billing'
+const OPT_KEY_SOURCE = 'opt:format-key'
 
 // -- state -----------------------------------------------------------------------------------------
 // The option (also kept in $.store) and what one session knows. Nothing but the option outlives the session.
@@ -26,8 +34,16 @@ const fmtSeq = atom({ plugin: 'orch-ui', key: 'fmtSeq' } as const, 0)
 const EMPTY_ORDER: FmtOrderItem[] = []
 // The keys that received a valid entry, oldest turn first.
 const fmtOrder = atom({ plugin: 'orch-ui', key: 'fmtOrder' } as const, EMPTY_ORDER)
-const EMPTY_STATS: FmtStats = { formatted: 0, kept: 0, last: null }
+const EMPTY_STATS: FmtStats = { formatted: 0, kept: 0, last: null, spentUsd: 0, billing: null, viaBaseUrl: false }
 const fmtStats = atom({ plugin: 'orch-ui', key: 'fmtStats' } as const, EMPTY_STATS)
+// The settings, also kept in $.store (loaded at session start; a stored value of another kind reads as the default).
+const fmtModel = atom({ plugin: 'orch-ui', key: 'fmtModel' } as const, DEFAULT_MODEL as string)
+const fmtEffort = atom({ plugin: 'orch-ui', key: 'fmtEffort' } as const, DEFAULT_EFFORT as string)
+const fmtBilling = atom({ plugin: 'orch-ui', key: 'fmtBilling' } as const, DEFAULT_BILLING as Billing)
+const fmtKey = atom({ plugin: 'orch-ui', key: 'fmtKey' } as const, DEFAULT_KEY_SOURCE as KeySource)
+// The reason formatting stopped for this session (a credential, model or setup failure), else null. Only a
+// settings press, a settings change or /clear clears it.
+const fmtPause = atom({ plugin: 'orch-ui', key: 'fmtPause' } as const, null as string | null)
 
 // One entry and one raw mark per message, by the key of its text.
 // The reference is written out in each call: the scan that lists what a module reads and writes needs literal
@@ -45,12 +61,11 @@ async function orderOf($: EngineInterface): Promise<FmtOrderItem[]> {
 }
 async function statsOf($: EngineInterface): Promise<FmtStats> {
   const v = await read($, fmtStats)
-  return v && typeof v.formatted === 'number' && typeof v.kept === 'number' ? v : EMPTY_STATS
+  return v && typeof v.formatted === 'number' && typeof v.kept === 'number' && typeof v.spentUsd === 'number' ? v : EMPTY_STATS
 }
 
 const keyOf = (text: string) => textKey(text.trim())
 const PENDING: FmtEntry = { state: 'pending' }
-const firstLine = (text: string) => (text.split('\n').find(l => l.trim()) ?? '').trim().slice(0, 80)
 
 // -- conversion ------------------------------------------------------------------------------------
 
@@ -58,28 +73,39 @@ const firstLine = (text: string) => (text.split('\n').find(l => l.trim()) ?? '')
 const enqueue = ($: EngineInterface, key: string, seq: number) =>
   update($, fmtOrder, list => [...(Array.isArray(list) ? list : []).filter(x => x.key !== key), { key, seq }].sort((a, b) => a.seq - b.seq))
 
-// Records one outcome: the entry, this session's counts, and the last reason.
-async function record($: EngineInterface, key: string, entry: FmtEntry, seq: number, r: Route, reason: string) {
+// Records one outcome: the entry, this session's counts and spend, and the last reason. `ran` is what the call
+// reported once it got as far as a run (its billing, and whether a gateway is set); without it the last stays.
+async function record($: EngineInterface, key: string, entry: FmtEntry, seq: number, a: { r: Route; model: string }, reason: string, costUsd: number, ran: CallSeen | null) {
   const ok = entry.state === 'done'
   if (ok) await enqueue($, key, seq)
   await changeEntry($, key, () => entry)
   await update($, fmtStats, s => {
-    const cur = s && typeof s.formatted === 'number' && typeof s.kept === 'number' ? s : EMPTY_STATS
-    return { formatted: cur.formatted + (ok ? 1 : 0), kept: cur.kept + (ok ? 0 : 1), last: { reason, kind: r.kind, model: r.model } }
+    const cur = s && typeof s.formatted === 'number' && typeof s.kept === 'number' && typeof s.spentUsd === 'number' ? s : EMPTY_STATS
+    return {
+      formatted: cur.formatted + (ok ? 1 : 0),
+      kept: cur.kept + (ok ? 0 : 1),
+      last: { reason, kind: a.r.kind, model: a.model },
+      spentUsd: cur.spentUsd + costUsd,
+      billing: ran ? ran.billing : cur.billing,
+      viaBaseUrl: ran ? ran.viaBaseUrl : cur.viaBaseUrl,
+    }
   })
 }
 
-// Asks the route's model for the rewrite of one reply and records the outcome. Anything that is not a valid
+const BILLINGS = ['api', 'subscription'] as const
+const KEY_SOURCES = ['env', 'file'] as const
+const settingOf = <T extends string>(v: unknown, allowed: readonly T[], fallback: T): T => (allowed.includes(v as T) ? (v as T) : fallback)
+
+// Asks for the rewrite of one reply (one `claude -p` call) and records the outcome. Anything that is not a valid
 // rewrite leaves the original on screen and records why.
 async function convert($: EngineInterface, text: string, seq: number) {
   const source = text.trim()
   const r = route(source)
   if (!r) return
   const key = keyOf(source)
-  const kept = (reason: string) => record($, key, { state: 'kept', kind: r.kind, reason }, seq, r, reason)
 
-  // Raw for the session or a switched-off option may have come in since the turn ended.
-  if ((await read($, fmtRaw)) || !(await read($, fmtOn))) return
+  // Raw for the session, a switched-off option or a pause may have come in since the turn ended.
+  if ((await read($, fmtRaw)) || !(await read($, fmtOn)) || (await read($, fmtPause)) != null) return
   let claimed = false
   await changeEntry($, key, cur => {
     claimed = cur === undefined
@@ -91,31 +117,19 @@ async function convert($: EngineInterface, text: string, seq: number) {
     return
   }
 
-  let res
-  try {
-    res = await $.model.complete({
-      model: r.model, effort: r.effort as ModelEffort, maxTokens: r.maxTokens, timeoutMs: r.timeoutMs,
-      system: FORMAT_SYSTEM, prompt: source,
-    })
-  } catch (err) {
-    await kept(`refused: ${firstLine(err instanceof Error ? err.message : String(err))}`)
+  const model = settingOf(await read($, fmtModel), MODELS, DEFAULT_MODEL)
+  const effort = settingOf(await read($, fmtEffort), EFFORTS, DEFAULT_EFFORT)
+  const billing = settingOf(await read($, fmtBilling), BILLINGS, DEFAULT_BILLING)
+  const keySource = settingOf(await read($, fmtKey), KEY_SOURCES, DEFAULT_KEY_SOURCE)
+  let ran: CallSeen | null = null
+  const res = await formatOnce(source, { model, effort, kind: r.kind }, req =>
+    formatCall($, req, { billing, keySource }, { seen: info => { ran = info } }))
+  if (!res.ok) {
+    if ((PAUSE_REASONS as readonly string[]).includes(res.reason)) await update($, fmtPause, () => res.reason)
+    await record($, key, { state: 'kept', kind: r.kind, reason: res.reason }, seq, { r, model }, res.reason, res.costUsd, ran)
     return
   }
-  if (!res.isAnswered) {
-    await kept(res.reason === 'aborted' ? 'timeout' : 'no-answer')
-    return
-  }
-  // The API gives no stop reason: a reply that used its whole cap was cut.
-  if (res.usage.output_tokens >= r.maxTokens) {
-    await kept('truncated')
-    return
-  }
-  const v = validate(source, res.text)
-  if (!v.ok) {
-    await kept(v.reason)
-    return
-  }
-  await record($, key, { state: 'done', kind: r.kind, parts: v.parts }, seq, r, 'ok')
+  await record($, key, { state: 'done', kind: r.kind, parts: res.parts }, seq, { r, model }, 'ok', res.costUsd, ran)
 }
 
 // -- raw -------------------------------------------------------------------------------------------
@@ -133,8 +147,14 @@ async function clearRaw($: EngineInterface) {
   for (const key of marked) await setMark($, key, false)
 }
 
+// Formatting may start again; called by the settings rows (step 11) and by /clear.
+export async function clearPause($: EngineInterface) {
+  await update($, fmtPause, () => null)
+}
+
 async function resetSession($: EngineInterface) {
   await clearRaw($)
+  await clearPause($)
   await update($, fmtOrch, () => false)
   await update($, fmtOrder, () => EMPTY_ORDER)
   await update($, fmtStats, () => EMPTY_STATS)
@@ -202,6 +222,17 @@ export async function loadFormat($: EngineInterface) {
   } catch {
     // The default stays: off.
   }
+  const load = async <T extends string>(storeKey: string, allowed: readonly T[], fallback: T, set: (v: T) => Promise<unknown>) => {
+    try {
+      await set(settingOf(await $.store.get(storeKey), allowed, fallback))
+    } catch {
+      // The default stays.
+    }
+  }
+  await load(OPT_MODEL, MODELS, DEFAULT_MODEL, v => update($, fmtModel, () => v))
+  await load(OPT_EFFORT, EFFORTS, DEFAULT_EFFORT, v => update($, fmtEffort, () => v))
+  await load(OPT_BILLING, BILLINGS, DEFAULT_BILLING, v => update($, fmtBilling, () => v))
+  await load(OPT_KEY_SOURCE, KEY_SOURCES, DEFAULT_KEY_SOURCE, v => update($, fmtKey, () => v))
 }
 
 // What the row shows: the option, and a note on raw state, this session's counts and the last outcome.
@@ -215,6 +246,10 @@ export async function formatRow($: EngineInterface): Promise<{ on: boolean; note
   else if (marked > 0) bits.push(`raw: ${marked} message(s)`)
   if (stats.formatted + stats.kept > 0) bits.push(`formatted ${stats.formatted} · as written ${stats.kept}`)
   if (stats.last) bits.push(`last: ${stats.last.reason} (${stats.last.kind}/${stats.last.model})`)
+  if (stats.billing) bits.push(`${stats.billing === 'api' ? 'api' : 'plan'} $${stats.spentUsd.toFixed(2)}`)
+  if (stats.viaBaseUrl) bits.push('via ANTHROPIC_BASE_URL')
+  const pause = await read($, fmtPause)
+  if (pause) bits.push(`paused: ${pause}`)
   return { on, note: bits.length ? bits.join(' · ') : null }
 }
 
@@ -400,7 +435,7 @@ export function registerFormat(on: On) {
   on('turn.complete', { reason: 'answer' }, async ($, e, next) => {
     const done = await next(e)
     if (e.agentId === undefined && route(e.answer) !== null) {
-      if ((await read($, fmtOrch)) === true && (await read($, fmtOn)) === true && (await read($, fmtRaw)) !== true) {
+      if ((await read($, fmtOrch)) === true && (await read($, fmtOn)) === true && (await read($, fmtRaw)) !== true && (await read($, fmtPause)) == null) {
         const seq = await update($, fmtSeq, n => (n ?? 0) + 1)
         const text = e.answer
         $.clock.after(0, () => void convert($, text, seq).catch(() => undefined))

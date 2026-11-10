@@ -17,12 +17,21 @@ export type FmtEntry =
   | { state: 'done'; kind: RouteKind; parts: Part[] }
   | { state: 'kept'; kind: RouteKind; reason: string }
 export type FmtOrderItem = { key: string; seq: number }
-export type FmtStats = { formatted: number; kept: number; last: { reason: string; kind: RouteKind; model: string } | null }
+export type FmtStats = {
+  formatted: number
+  kept: number
+  last: { reason: string; kind: RouteKind; model: string } | null
+  spentUsd: number
+  billing: Billing | null
+  viaBaseUrl: boolean
+}
 
 // One formatter call through a `claude -p` child (hooks/format.ts builds the argv and env and checks the stream).
 // `api` is `--bare` with ANTHROPIC_API_KEY; `subscription` is the claude.ai login with the key blanked.
 export type Billing = 'api' | 'subscription'
 export type Effort = 'low' | 'medium' | 'high'
+// Where an api run gets its key: the session's ANTHROPIC_API_KEY (inherited, never read), or the key file.
+export type KeySource = 'env' | 'file'
 export type CallRequest = { system: string; prompt: string; model: string; effort: string; kind: RouteKind }
 // Why a call produced no text. The first group stops formatting for the session until a row is pressed.
 export type CallReason =
@@ -34,6 +43,9 @@ export type CallReason =
   | 'cloud-provider'
   | 'base-url-set'
   | 'workdir-failed'
+  | 'key-file-missing'
+  | 'key-file-unsafe'
+  | 'key-file-invalid'
   | 'rate-limited'
   | 'overloaded'
   | 'api-error'
@@ -58,6 +70,11 @@ declare module 'claude-code' {
       fmtStats: FmtStats
       fmtEntries: StateFamily<FmtEntry>
       fmtMarks: StateFamily<boolean>
+      fmtModel: string
+      fmtEffort: string
+      fmtBilling: Billing
+      fmtKey: KeySource
+      fmtPause: string | null
     }
   }
 }

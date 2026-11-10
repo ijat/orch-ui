@@ -2,28 +2,18 @@
 // No runtime imports, so the benchmark can import this file with plain `node` (types are stripped).
 // Drawing and wiring live in format-view.tsx and register.tsx.
 
-import type { BannerTag, Billing, CallOutcome, CallReason, CallRequest, Effort, Part, Row, RowTag, RouteKind, SectionTag } from '../types'
+import type { BannerTag, Billing, KeySource, CallOutcome, CallReason, CallRequest, Effort, Part, Row, RowTag, RouteKind, SectionTag } from '../types'
 
 // -- routes ---------------------------------------------------------------------------------------
 
-// Two routes by length. Model, effort, token cap and timeout are data, so changing a route
-// is a change of these values only.
-// Set by the formatter benchmark 2026-11-10: 11 short, 6 long messages.
-export const SHORT_MODEL = 'opus'
-export const SHORT_EFFORT = 'low'
-export const SHORT_MAX_TOKENS = 4000
-export const SHORT_TIMEOUT_MS = 30000
-export const LONG_MODEL = 'opus'
-export const LONG_EFFORT = 'low'
-export const LONG_MAX_TOKENS = 8000
-export const LONG_TIMEOUT_MS = 90000
-
+// Two routes by length. Which model, effort, output cap and time limit a route uses comes from the
+// settings and LIMITS (below).
 export const SHORT_MIN = 300
 export const SHORT_MAX = 2000
 export const LONG_MAX = 5000
 
-export type { Billing, CallOutcome, CallReason, CallRequest, Effort, RouteKind } from '../types'
-export type Route = { kind: RouteKind; model: string; effort: string; maxTokens: number; timeoutMs: number }
+export type { Billing, KeySource, CallOutcome, CallReason, CallRequest, Effort, RouteKind } from '../types'
+export type Route = { kind: RouteKind }
 
 const FENCE_ANY = /```|^\s*~~~/m
 // A table separator row: a pipe, then only dashes, colons, spaces and pipes, with at least one dash.
@@ -37,10 +27,10 @@ export function route(text: string): Route | null {
   if (FENCE_ANY.test(t) || TABLE_SEP.test(t) || BANNER_ANY.test(t)) return null
   const n = t.length
   if (n >= SHORT_MIN && n <= SHORT_MAX) {
-    return { kind: 'short', model: SHORT_MODEL, effort: SHORT_EFFORT, maxTokens: SHORT_MAX_TOKENS, timeoutMs: SHORT_TIMEOUT_MS }
+    return { kind: 'short' }
   }
   if (n > SHORT_MAX && n <= LONG_MAX) {
-    return { kind: 'long', model: LONG_MODEL, effort: LONG_EFFORT, maxTokens: LONG_MAX_TOKENS, timeoutMs: LONG_TIMEOUT_MS }
+    return { kind: 'long' }
   }
   return null
 }
@@ -144,7 +134,7 @@ export function contrast(a: string, b: string): number {
 
 export type { BannerTag, Part, Row, RowTag, SectionTag } from '../types'
 
-// Why an output was not drawn. The view adds `truncated`, `timeout` and `no-answer` on its side.
+// Why a rewrite was not drawn. A call that produced no text has a CallReason instead.
 export type Reason =
   | 'empty'
   | 'no-banner'
@@ -331,6 +321,8 @@ export const MODELS = ['opus', 'sonnet', 'haiku'] as const
 export const EFFORTS = ['low', 'medium', 'high'] as const
 export const DEFAULT_MODEL = 'opus'
 export const DEFAULT_EFFORT = 'low'
+export const DEFAULT_BILLING = 'api'
+export const DEFAULT_KEY_SOURCE = 'env'
 
 // Output cap and time limit by length and effort: the larger of the step 1 placeholder and twice the
 // largest maximum the step 2b benchmark saw at that effort over all models, rounded up.
@@ -484,4 +476,37 @@ export async function formatOnce(
   if (out.ok !== true) return { ok: false, reason: out.reason, costUsd }
   const v = validate(source, out.text)
   return v.ok ? { ok: true, parts: v.parts, costUsd, durationMs: out.durationMs } : { ok: false, reason: v.reason, costUsd }
+}
+
+// -- the API key file ---------------------------------------------------------------------------------
+// `~/.claude/settings.local.json`, field `orchUi.formatApiKey`. Parsed the way the CLI will use the value:
+// it is sent exactly as written, never trimmed or repaired, so anything doubtful is refused.
+
+const KEY_SHAPE = /^[\x21-\x7e]{20,256}$/
+
+export type KeyParse = { ok: true; key: string } | { ok: false; reason: 'key-file-invalid' }
+
+export function parseKeyFile(text: string): KeyParse {
+  const bad = { ok: false, reason: 'key-file-invalid' } as const
+  try {
+    if (typeof text !== 'string') return bad
+    // JSON.parse keeps the last of two fields of one name, so a second one anywhere is refused.
+    if (text.split('"formatApiKey"').length !== 2) return bad
+    const o: unknown = JSON.parse(text)
+    const v = isObject(o) && isObject(o.orchUi) ? o.orchUi.formatApiKey : undefined
+    if (typeof v !== 'string' || !KEY_SHAPE.test(v)) return bad
+    // The value must be written as it is read: no \u escape or \/ that makes the file say one thing and parse as another.
+    if (!text.includes(JSON.stringify(v))) return bad
+    return { ok: true, key: v }
+  } catch {
+    return bad
+  }
+}
+
+// Whether `ls -ln` says the file is a regular file only its owner can touch: no group or other bit, no ACL
+// marker (`+`). `@` (extended attributes) and `.` (a security label) do not widen access. A failed command is unsafe.
+export function keyFileModeOk(stdout: string, exitCode: number): boolean {
+  if (exitCode !== 0 || typeof stdout !== 'string') return false
+  const m = /^-[r-][w-][x-]-{6}([@.+]?)\s/.exec(stdout)
+  return m !== null && m[1] !== '+'
 }
