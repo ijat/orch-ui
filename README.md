@@ -2,7 +2,7 @@
 
 A Claude Code plugin that redraws the finished replies of an [orch](https://github.com/ijat/orch) orchestrator session in a fixed layout: a colored banner with the point, what you must do, what blocks you, the rest, and the replies you can type. It is a redraw only; the transcript never changes, and sessions that did not load the `orchestrate` skill are left alone.
 
-The code started in [orch-pane](https://github.com/ijat/orch-pane) (commit b0c0f2e of its formatter branch) and moved here.
+The code started in [orch-pane](https://github.com/ijat/orch-pane) and moved here.
 
 Terminal only. Off by default. A reply is rewritten by one `claude -p` call, so the formatting costs money or plan usage: read **Billing** below before switching it on.
 
