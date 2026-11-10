@@ -337,13 +337,21 @@ test('session start registers /orch-ui once and /orch-ui opens the pane', async 
   expect(b.w.opened[0]).toMatchObject({ id: 'orch-ui', title: 'orch-ui', closeOnEscape: true })
 })
 
-test('the pane holds the Format replies row and nothing else', async ($, on) => {
-  await boot($, on)
+test('the pane holds the Format replies row and the five setting rows, in order', async ($, on) => {
+  await boot($, on, SETTINGS_SEED)
   const ui = await settingsPane($)
-  expect((await ui.findAll({ type: 'Button' })).map(x => x.key)).toEqual(['opt-format'])
+  expect((await ui.findAll({ type: 'Button' })).map(x => x.key)).toEqual(['opt-format', ...ROW_KEYS])
   expect((await optionRow(ui)).label).toBe('[x] Format replies')
   await ui.unmount()
 })
+
+// The setting rows: stored keys, the pane's button keys and the default stored values.
+const SETTINGS_SEED = { 'opt:format': true, 'opt:format-trigger': undefined }
+const ROW_KEYS = ['opt-format-trigger', 'opt-format-model', 'opt-format-effort', 'opt-format-billing', 'opt-format-key']
+type SettingsPane = Awaited<ReturnType<typeof settingsPane>>
+const buttonText = async (ui: SettingsPane, key: string) => (await ui.find({ type: 'Button', key }))?.text
+const buttonKeys = async (ui: SettingsPane) => (await ui.findAll({ type: 'Button' })).map(x => x.key)
+const paneTexts = async (ui: SettingsPane) => (await ui.findAll({ type: 'Text' })).map(t => t.text)
 
 // -- the settings row ------------------------------------------------------------------------------------
 
@@ -365,6 +373,153 @@ test('Format replies reads the stored option at session start', async ($, on) =>
   await boot($, on, { 'opt:format': true })
   const ui = await settingsPane($)
   expect((await optionRow(ui)).label).toBe('[x] Format replies')
+  await ui.unmount()
+})
+
+// -- the setting rows -----------------------------------------------------------------------------------
+
+test('setting rows: labels, values and notes at the defaults', async ($, on) => {
+  await boot($, on, SETTINGS_SEED)
+  const ui = await settingsPane($)
+  expect(await buttonText(ui, 'opt-format-trigger')).toBe('Format trigger: marked')
+  expect(await buttonText(ui, 'opt-format-model')).toBe('Format model: opus')
+  expect(await buttonText(ui, 'opt-format-effort')).toBe('Format effort: low')
+  expect(await buttonText(ui, 'opt-format-billing')).toBe('Format billing: API key')
+  expect(await buttonText(ui, 'opt-format-key')).toBe('Format API key: ANTHROPIC_API_KEY')
+  const texts_ = await paneTexts(ui)
+  expect(texts_).toContain('only replies the orchestrator marks')
+  expect(texts_).toContain("API key: billed to that key's account")
+  expect(texts_).toContain('from ANTHROPIC_API_KEY')
+  await ui.unmount()
+})
+
+const CYCLES: [string, string, string, [string, string][]][] = [
+  ['trigger', 'opt-format-trigger', 'opt:format-trigger', [['Format trigger: auto', 'auto'], ['Format trigger: marked', 'marked']]],
+  ['model', 'opt-format-model', 'opt:format-model', [['Format model: sonnet', 'sonnet'], ['Format model: haiku', 'haiku'], ['Format model: opus', 'opus']]],
+  ['effort', 'opt-format-effort', 'opt:format-effort', [['Format effort: medium', 'medium'], ['Format effort: high', 'high'], ['Format effort: low', 'low']]],
+  ['billing', 'opt-format-billing', 'opt:format-billing', [['Format billing: subscription', 'subscription'], ['Format billing: API key', 'api']]],
+  ['key', 'opt-format-key', 'opt:format-key', [['Format API key: ~/.claude/settings.local.json', 'file'], ['Format API key: ANTHROPIC_API_KEY', 'env']]],
+]
+for (const [name, key, storeKey, steps] of CYCLES) {
+  test(`setting row ${name}: each press moves to the next value and stores it under ${storeKey}`, async ($, on) => {
+    const b = await boot($, on, SETTINGS_SEED)
+    const ui = await settingsPane($)
+    expect(b.w.store.get(storeKey)).toBeUndefined()
+    for (const [shown, stored] of steps) {
+      await ui.press({ key })
+      expect(await buttonText(ui, key)).toBe(shown)
+      expect(b.w.store.get(storeKey)).toBe(stored)
+    }
+    await ui.unmount()
+  })
+}
+
+test('setting rows: the notes follow the values', async ($, on) => {
+  await boot($, on, SETTINGS_SEED)
+  const ui = await settingsPane($)
+  await ui.press({ key: 'opt-format-trigger' })
+  expect(await paneTexts(ui)).toContain('every eligible reply')
+  expect(await paneTexts(ui)).not.toContain('only replies the orchestrator marks')
+  await ui.press({ key: 'opt-format-key' })
+  expect(await paneTexts(ui)).toContain('from ~/.claude/settings.local.json')
+  await ui.press({ key: 'opt-format-billing' })
+  expect(await paneTexts(ui)).toContain('subscription: counts toward your plan')
+  expect(await paneTexts(ui)).not.toContain("API key: billed to that key's account")
+  await ui.unmount()
+})
+
+test('setting rows: the API key row is drawn only while billing is api', async ($, on) => {
+  await boot($, on, SETTINGS_SEED)
+  const ui = await settingsPane($)
+  expect(await buttonKeys(ui)).toContain('opt-format-key')
+  await ui.press({ key: 'opt-format-billing' })
+  expect(await buttonKeys(ui)).toEqual(['opt-format', 'opt-format-trigger', 'opt-format-model', 'opt-format-effort', 'opt-format-billing'])
+  expect((await paneTexts(ui)).some(t => t.startsWith('from '))).toBe(false)
+  await ui.press({ key: 'opt-format-billing' })
+  expect(await buttonKeys(ui)).toEqual(['opt-format', ...ROW_KEYS])
+  await ui.unmount()
+})
+
+test('setting rows: an unknown stored value reads as the default', async ($, on) => {
+  await boot($, on, { 'opt:format': true, 'opt:format-trigger': 'sometimes', 'opt:format-model': 'fable', 'opt:format-effort': 'max', 'opt:format-billing': 'oauth', 'opt:format-key': 7 })
+  const ui = await settingsPane($)
+  expect(await buttonText(ui, 'opt-format-trigger')).toBe('Format trigger: marked')
+  expect(await buttonText(ui, 'opt-format-model')).toBe('Format model: opus')
+  expect(await buttonText(ui, 'opt-format-effort')).toBe('Format effort: low')
+  expect(await buttonText(ui, 'opt-format-billing')).toBe('Format billing: API key')
+  expect(await buttonText(ui, 'opt-format-key')).toBe('Format API key: ANTHROPIC_API_KEY')
+  // the first press moves on from the default, not from the unknown value
+  await ui.press({ key: 'opt-format-model' })
+  expect(await buttonText(ui, 'opt-format-model')).toBe('Format model: sonnet')
+  await ui.unmount()
+})
+
+test('setting rows: the stored values are read at session start', async ($, on) => {
+  await boot($, on, { 'opt:format': true, 'opt:format-trigger': 'auto', 'opt:format-model': 'haiku', 'opt:format-effort': 'high', 'opt:format-billing': 'subscription', 'opt:format-key': 'file' })
+  const ui = await settingsPane($)
+  expect(await buttonText(ui, 'opt-format-trigger')).toBe('Format trigger: auto')
+  expect(await buttonText(ui, 'opt-format-model')).toBe('Format model: haiku')
+  expect(await buttonText(ui, 'opt-format-effort')).toBe('Format effort: high')
+  expect(await buttonText(ui, 'opt-format-billing')).toBe('Format billing: subscription')
+  expect(await buttonKeys(ui)).not.toContain('opt-format-key')
+  await ui.unmount()
+})
+
+test('setting rows: a press applies from the next call', async ($, on) => {
+  const b = await boot($, on, SETTINGS_SEED)
+  const ui = await settingsPane($)
+  await ui.press({ key: 'opt-format-trigger' })
+  await ui.press({ key: 'opt-format-model' })
+  await ui.press({ key: 'opt-format-effort' })
+  await ui.press({ key: 'opt-format-billing' })
+  await ui.unmount()
+  await convertOne($, b)
+  expect(lastCall(b)).toMatchObject({ model: 'sonnet', effort: 'medium', maxTokens: LIMITS.short.medium.maxTokens, timeoutMs: LIMITS.short.medium.timeoutMs })
+  expect(lastCall(b).argv.includes('--bare')).toBe(false)
+})
+
+for (const id of ['opt-format-trigger', 'opt-format-model', 'opt-format-effort', 'opt-format-billing', 'opt-format-key']) {
+  test(`setting rows: a press of ${id} clears a pause`, async ($, on) => {
+    const b = await boot($, on)
+    b.w.replies.set(options.source, { stdout: cli.stream(cli.init('none'), cli.resultOk(options.output, { total_cost_usd: 0.0061 })) })
+    await orchestrate($)
+    await finish($, b, options.source)
+    const ui = await settingsPane($)
+    expect((await optionRow(ui)).note).toMatch(/paused: billing-mismatch$/)
+    await ui.press({ key: id })
+    expect((await optionRow(ui)).note).not.toMatch(/paused/)
+    await ui.unmount()
+  })
+}
+
+test('setting rows: the key row names the source and the last key reason, and shows no key, no gateway value', async ($, on) => {
+  const URL = 'https://gateway.example.test/sentinel-path'
+  const b = await boot($, on, { 'opt:format': true, 'opt:format-key': 'file' }, { HOME: '/home/u', ANTHROPIC_BASE_URL: URL })
+  b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw-------' })
+  await convertOne($, b)
+  const ui = await settingsPane($)
+  expect(await paneTexts(ui)).toContain('from ~/.claude/settings.local.json · last: base-url-set')
+  const all = JSON.stringify(await paneTexts(ui))
+  expect(all.includes(cli.KEY)).toBe(false)
+  expect(all.includes('sentinel')).toBe(false)
+  expect(all.includes('gateway.example')).toBe(false)
+  await ui.unmount()
+})
+
+test('setting rows: a missing key file is the last key reason', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true, 'opt:format-key': 'file' })
+  await convertOne($, b)
+  const ui = await settingsPane($)
+  expect(await paneTexts(ui)).toContain('from ~/.claude/settings.local.json · last: key-file-missing')
+  await ui.unmount()
+})
+
+test('setting rows: after a success the key row carries no reason', async ($, on) => {
+  const b = await boot($, on, SETTINGS_SEED)
+  await convertOne($, b, options.source, options.output)
+  const ui = await settingsPane($)
+  expect(await paneTexts(ui)).toContain('from ANTHROPIC_API_KEY')
+  expect((await paneTexts(ui)).some(t => t.startsWith('from ') && t.includes('last:'))).toBe(false)
   await ui.unmount()
 })
 
