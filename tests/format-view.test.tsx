@@ -667,6 +667,84 @@ test('/clear forgets the marking, the raw state and the list; the option stays',
   expect(b.w.store.get('opt:format')).toBe(true)
 })
 
+// -- /clear: every atom reads its default while $.store holds the user's choices ---------------------------------
+// A /clear gives the session a new id and fires no session.start, and the engine resets the plugin's atoms with the
+// session. The kit keeps atoms across session.end, so this builds the same state directly: boot with an empty store
+// (session.start loads the defaults into the atoms; boot's own trigger seed is dropped), then store the choices.
+
+const CHOSEN = { 'opt:format': true, 'opt:format-trigger': 'auto', 'opt:format-model': 'sonnet', 'opt:format-effort': 'medium', 'opt:format-billing': 'subscription', 'opt:format-key': 'file' }
+async function bootThenStore($: Engine, on: On, stored: Record<string, unknown> = CHOSEN) {
+  const b = await boot($, on, { 'opt:format-trigger': undefined })
+  for (const [k, v] of Object.entries(stored)) b.w.store.set(k, v)
+  return b
+}
+
+test('after a /clear the stored model, effort and billing are the ones a conversion uses and the pane draws', async ($, on) => {
+  const b = await bootThenStore($, on)
+  // The instrument: the atoms really read their defaults here (a pane left open draws them; see the README).
+  const before = await settingsPane($)
+  expect((await optionRow(before)).label).toBe('[ ] Format replies')
+  expect(await buttonText(before, 'opt-format-model')).toBe('Format model: opus')
+  await before.unmount()
+  await convertOne($, b)
+  expect(b.w.calls).toHaveLength(1)
+  // Stored subscription billing: no --bare, so no API key can pay for this call.
+  expect(lastCall(b)).toMatchObject({ model: 'sonnet', effort: 'medium', maxTokens: LIMITS.short.medium.maxTokens, timeoutMs: LIMITS.short.medium.timeoutMs })
+  expect(lastCall(b).argv.includes('--bare')).toBe(false)
+  expect(await noteOf($)).toBe('formatted 1 · as written 0 · last: ok (short/sonnet) · plan $0.01')
+  const ui = await settingsPane($)
+  expect((await optionRow(ui)).label).toBe('[x] Format replies')
+  expect(await buttonText(ui, 'opt-format-model')).toBe('Format model: sonnet')
+  expect(await buttonText(ui, 'opt-format-effort')).toBe('Format effort: medium')
+  expect(await buttonText(ui, 'opt-format-billing')).toBe('Format billing: subscription')
+  await ui.unmount()
+})
+
+test('after a /clear /orch-ui loads the stored settings before the pane opens', async ($, on) => {
+  const b = await bootThenStore($, on)
+  await $.command.run({ command: 'orch-ui', args: '' } as never)
+  await b.clock.settle()
+  const ui = await settingsPane($)
+  expect((await optionRow(ui)).label).toBe('[x] Format replies')
+  expect(await buttonText(ui, 'opt-format-trigger')).toBe('Format trigger: auto')
+  expect(await buttonText(ui, 'opt-format-model')).toBe('Format model: sonnet')
+  expect(await buttonText(ui, 'opt-format-billing')).toBe('Format billing: subscription')
+  await ui.unmount()
+})
+
+test('after a /clear a press of the Format replies row flips the stored option, not the default', async ($, on) => {
+  const b = await bootThenStore($, on)
+  const ui = await settingsPane($)
+  await ui.press({ key: 'opt-format' })
+  expect(b.w.store.get('opt:format')).toBe(false)
+  expect((await optionRow(ui)).label).toBe('[ ] Format replies')
+  // The other choices were loaded by the same press and stay as stored.
+  expect(await buttonText(ui, 'opt-format-model')).toBe('Format model: sonnet')
+  expect(await buttonText(ui, 'opt-format-billing')).toBe('Format billing: subscription')
+  await ui.unmount()
+})
+
+const AFTER_CLEAR: [string, string, string, string][] = [
+  ['trigger', 'opt-format-trigger', 'opt:format-trigger', 'marked'],
+  ['model', 'opt-format-model', 'opt:format-model', 'haiku'],
+  ['effort', 'opt-format-effort', 'opt:format-effort', 'high'],
+  ['billing', 'opt-format-billing', 'opt:format-billing', 'api'],
+  ['key', 'opt-format-key', 'opt:format-key', 'env'],
+]
+for (const [name, key, storeKey, expected] of AFTER_CLEAR) {
+  test(`after a /clear the first press of the ${name} row moves on from the stored value (${expected}) and the other stored values stay`, async ($, on) => {
+    // Billing is api here so the key row exists; every other stored value is the user's.
+    const stored = name === 'key' ? { ...CHOSEN, 'opt:format-billing': 'api' } : CHOSEN
+    const b = await bootThenStore($, on, stored)
+    const ui = await settingsPane($)
+    await ui.press({ key })
+    expect(b.w.store.get(storeKey)).toBe(expected)
+    for (const [k, v] of Object.entries(stored)) if (k !== storeKey && k !== 'opt:format') expect(b.w.store.get(k)).toBe(v)
+    expect(b.w.store.get('opt:format')).toBe(true)
+    await ui.unmount()
+  })
+}
+
 test('a session end for another reason keeps the state', async ($, on) => {
   const b = await boot($, on)
   const { second } = await twoFormatted($, b)

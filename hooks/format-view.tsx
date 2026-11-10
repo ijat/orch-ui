@@ -54,6 +54,10 @@ const fmtPause = atom({ plugin: 'orch-ui', key: 'fmtPause' } as const, null as s
 const fmtTrigger = atom({ plugin: 'orch-ui', key: 'fmtTrigger' } as const, DEFAULT_TRIGGER as Trigger)
 // The newest eligible reply of this session, converted or not (what "format that" means).
 const fmtLatest = atom({ plugin: 'orch-ui', key: 'fmtLatest' } as const, null as FmtLatest | null)
+// True once a hook that waited for it has read the settings from $.store into this session's atoms. A /clear gives the
+// session a new id and fires no session.start, and the engine resets every atom with it: this flag goes back to false
+// with the settings, which is what asks for the next load.
+const fmtLoaded = atom({ plugin: 'orch-ui', key: 'fmtLoaded' } as const, false)
 
 // One entry and one raw mark per message, by the key of its text.
 // The reference is written out in each call: the scan that lists what a module reads and writes needs literal
@@ -172,6 +176,7 @@ async function resetSession($: EngineInterface) {
   await update($, fmtOrder, () => EMPTY_ORDER)
   await update($, fmtStats, () => EMPTY_STATS)
   await update($, fmtLatest, () => null)
+  await update($, fmtLoaded, () => false)
 }
 
 // "Format that": converts the session's latest eligible reply when it was left as written. Only that reply; an older
@@ -254,7 +259,8 @@ async function registerTool($: EngineInterface) {
 
 // -- the settings row ---------------------------------------------------------------------------------
 
-// Called from register.tsx's session.start: a second unmatched hook on that event is refused.
+// Reads the settings from $.store into this session's atoms. Called from register.tsx's session.start (a second
+// unmatched hook on that event is refused), which does not wait for it, so that call does not count as loaded.
 export async function loadFormat($: EngineInterface) {
   try {
     const stored = await $.store.get(OPT_KEY)
@@ -274,6 +280,20 @@ export async function loadFormat($: EngineInterface) {
   await load(OPT_BILLING, BILLINGS, DEFAULT_BILLING, v => update($, fmtBilling, () => v))
   await load(OPT_KEY_SOURCE, KEY_SOURCES, DEFAULT_KEY_SOURCE, v => update($, fmtKey, () => v))
   await load(OPT_TRIGGER, TRIGGERS, DEFAULT_TRIGGER, v => update($, fmtTrigger, () => v))
+}
+
+// Every hook that reads or writes a setting, and comes before any use after a /clear, calls this first: the atoms
+// read their defaults then while $.store holds the user's values, and a press or a conversion from the defaults would
+// overwrite the store or spend against the stored choice. While `fmtLoaded` is not true the settings are read again;
+// once true it cannot undo a press, because a press writes the store too. Never throws.
+export async function ensureLoaded($: EngineInterface) {
+  try {
+    if ((await read($, fmtLoaded)) === true) return
+    await loadFormat($)
+    await update($, fmtLoaded, () => true)
+  } catch {
+    // The atoms stay as they are; the next hook tries again.
+  }
 }
 
 // What the row shows: the option, and a note on raw state, this session's counts and the last outcome.
@@ -297,6 +317,7 @@ export async function formatRow($: EngineInterface): Promise<{ on: boolean; note
 
 // A press with any raw state set clears it and keeps the option on; otherwise it flips the option.
 export async function pressFormat($: EngineInterface) {
+  await ensureLoaded($)
   if ((await read($, fmtRaw)) === true || (await markedKeys($)).length > 0) {
     await clearRaw($)
     return
@@ -356,6 +377,7 @@ const nextOf = <T extends string>(all: readonly T[], cur: T): T => all[(all.inde
 
 // One press: lifts a pause, moves the setting to its next value and stores it.
 export async function pressSetting($: EngineInterface, id: SettingId) {
+  await ensureLoaded($)
   await clearPause($)
   const s = await settingsNow($)
   let storeKey: string
@@ -554,6 +576,8 @@ export function registerFormat(on: On) {
   // formatted until it loads again; the resume flow loads it.
   on('skill.prompt', { skill: SKILL }, async ($, e, next) => {
     const out = await next(e)
+    // Every conversion and the tool wait for this hook, so the settings they use are the stored ones.
+    await ensureLoaded($)
     if ((await read($, fmtOrch)) !== true) {
       await update($, fmtOrch, () => true)
       await registerTool($)

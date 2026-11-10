@@ -1,6 +1,6 @@
 import type { Register } from 'claude-code'
 
-import { formatRow, loadFormat, pressFormat, pressSetting, registerFormat, settingRows } from './format-view'
+import { ensureLoaded, formatRow, loadFormat, pressFormat, pressSetting, registerFormat, settingRows } from './format-view'
 
 const PANE = 'orch-ui'
 
@@ -16,6 +16,7 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'orch-ui' }, async $ => {
+    await ensureLoaded($)
     await $.ui.open({ id: PANE, title: PANE, closeOnEscape: true })
 
     return { text: 'orch-ui settings opened.' }
