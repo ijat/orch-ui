@@ -19,6 +19,34 @@ export type FmtEntry =
 export type FmtOrderItem = { key: string; seq: number }
 export type FmtStats = { formatted: number; kept: number; last: { reason: string; kind: RouteKind; model: string } | null }
 
+// One formatter call through a `claude -p` child (hooks/format.ts builds the argv and env and checks the stream).
+// `api` is `--bare` with ANTHROPIC_API_KEY; `subscription` is the claude.ai login with the key blanked.
+export type Billing = 'api' | 'subscription'
+export type Effort = 'low' | 'medium' | 'high'
+export type CallRequest = { system: string; prompt: string; model: string; effort: string; kind: RouteKind }
+// Why a call produced no text. The first group stops formatting for the session until a row is pressed.
+export type CallReason =
+  | 'billing-mismatch'
+  | 'model-mismatch'
+  | 'no-credential'
+  | 'auth-failed'
+  | 'cli-missing'
+  | 'cloud-provider'
+  | 'base-url-set'
+  | 'workdir-failed'
+  | 'rate-limited'
+  | 'overloaded'
+  | 'api-error'
+  | 'truncated'
+  | 'cli-error'
+  | 'no-answer'
+  | 'cli-output'
+  | 'cli-failed'
+  | 'timeout'
+export type CallOutcome =
+  | { ok: true; text: string; costUsd: number; durationMs: number; durationApiMs: number; outputTokens: number }
+  | { ok: false; reason: CallReason; costUsd: number }
+
 declare module 'claude-code' {
   interface PluginState {
     'orch-ui': {
