@@ -3,7 +3,7 @@ import type { On } from 'claude-code'
 import type { Engine, MockClock } from 'claude-code/testing'
 
 import { FORMAT_SYSTEM, KINDS, LIMITS, MARK } from '../hooks/format'
-import { FORMAT_TOOL, FORMAT_TOOL_FULL } from '../hooks/format-view'
+import { FORMAT_TOOL, FORMAT_TOOL_FULL, PILL_LEFT, PILL_RIGHT } from '../hooks/format-view'
 import * as cli from './fixtures/format/cli'
 import * as done from './fixtures/format/done'
 import * as long from './fixtures/format/long'
@@ -191,6 +191,13 @@ const SHORT_MODEL = SHORT_ROUTE.model
 const LONG_MODEL = LONG_ROUTE.model
 
 // -- conversion --------------------------------------------------------------------------------------
+
+test('pills keep their Nerd Font round caps and the kinds keep their icons', () => {
+  expect(PILL_LEFT).toBe('\ue0b6')
+  expect(PILL_RIGHT).toBe('\ue0b4')
+  const icons: Record<string, string> = { branch: '\ue725', file: '\uf15b', commit: '\uf417', reply: '\uf112' }
+  for (const [name, icon] of Object.entries(icons)) expect(KINDS[name as keyof typeof KINDS].icon).toBe(icon)
+})
 
 test('an orchestrator reply is asked of the short route once and the row swaps to the banner format', async ($, on) => {
   const b = await boot($, on)
