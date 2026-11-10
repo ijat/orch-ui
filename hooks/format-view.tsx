@@ -192,10 +192,12 @@ async function endTurn($: EngineInterface) {
   await syncTimer($)
 }
 
-// Takes the claim on a text's entry: pending, with the time. True when this call took it (no entry yet, or a retry of one
-// that ended as written); that call owes a pendingEnd.
-async function claimEntry($: EngineInterface, key: string, retry: boolean): Promise<boolean> {
-  const since = await $.clock.now()
+// Takes the claim on a text's entry: pending, with the time (`begun`, else now). True when this call took it (no entry yet,
+// or a retry of one that ended as written); that call owes a pendingEnd.
+async function claimEntry($: EngineInterface, key: string, retry: boolean, begun?: number): Promise<boolean> {
+  // `begun`: when the work on this reply began for the person watching (its first flush, or the start of the turn), so the
+  // counter does not start again at 0 when the placeholder gives way to the pending one.
+  const since = begun ?? (await $.clock.now())
   let claimed = false
   await changeEntry($, key, cur => {
     // A request may take one more try at a reply whose first try ended as written.
@@ -853,11 +855,13 @@ type Stream = {
   verdict: boolean | undefined
   decided: Promise<boolean>
   settle: (v: boolean) => void
+  // when flush 0 decided to hide the reply (the clock's ms), if it did and the clock answered
+  since: number | undefined
 }
 // Open messages by message id. Module state: the hook of one flush must see what the others did, and a flush does not wait for the one before.
 const streams = new Map<string, Stream>()
 // A marked reply's original under its tag: null text while it streams (or when it cannot be known), the whole text once the final flush ran.
-type Held = { text: string | null; final: boolean }
+type Held = { text: string | null; final: boolean; since: number | undefined }
 const held = new Map<string, Held>()
 
 // The tag id of a message: 8 hex characters of the hash of its message id.
@@ -870,7 +874,7 @@ function streamOf(messageId: string): Stream {
     const decided = new Promise<boolean>(resolve => {
       settle = resolve
     })
-    m = { tag: tagIdOf(messageId), deltas: [], verdict: undefined, decided, settle }
+    m = { tag: tagIdOf(messageId), deltas: [], verdict: undefined, decided, settle, since: undefined }
     streams.set(messageId, m)
     if (streams.size > STREAMS_MAX) streams.delete(streams.keys().next().value as string)
   }
@@ -914,6 +918,17 @@ async function verdictOf($: EngineInterface, m: Stream): Promise<boolean> {
 const deltaText = (m: Stream) => m.deltas.join('')
 const isComplete = (m: Stream, last: number) => m.deltas.length === last + 1 && m.deltas.every(d => d !== undefined)
 
+// Claims and starts the conversion of a hidden block whose original is complete. The turn's end converts the answer too,
+// but finds the claim taken and does nothing (one key, one conversion). Nothing here may fail a flush.
+async function startBlock($: EngineInterface, original: string, begun: number | undefined) {
+  const { marked, text } = stripMark(original)
+  if (!marked || route(text) === null) return
+  if ((await read($, fmtRaw)) === true || (await read($, fmtOn)) !== true || (await read($, fmtPause)) != null) return
+  const seq = await update($, fmtSeq, n => (n ?? 0) + 1)
+  const claimed = await claimEntry($, keyOf(text), false, begun)
+  $.clock.after(0, () => void convert($, text, seq, false, claimed).catch(() => undefined))
+}
+
 type Flush = { message_id: string; index: number; final: boolean; delta: string; agent_id?: string }
 
 // The `displayContent` of one flush, or undefined to leave it as it is. The part before the first await runs when the
@@ -927,9 +942,10 @@ async function displayOf($: EngineInterface, e: Flush): Promise<string | undefin
     let verdict = false
     try {
       verdict = await hidesReply($, e.delta)
+      if (verdict) m.since = await $.clock.now().catch(() => undefined)
     } finally {
       m.verdict = verdict
-      if (verdict) holdText(m.tag, { text: null, final: false })
+      if (verdict) holdText(m.tag, { text: null, final: false, since: m.since })
       else m.deltas = []
       m.settle(verdict)
     }
@@ -940,7 +956,11 @@ async function displayOf($: EngineInterface, e: Flush): Promise<string | undefin
     return undefined
   }
   if (e.final) {
-    holdText(m.tag, { text: isComplete(m, e.index) ? deltaText(m) : null, final: true })
+    const original = isComplete(m, e.index) ? deltaText(m) : null
+    // The original is complete: this block's conversion starts now, not at the end of the turn (D12). The claim is taken
+    // before the row can draw as final, so it goes from the placeholder to the pending one with nothing between.
+    if (original !== null) await startBlock($, original, m.since).catch(() => undefined)
+    holdText(m.tag, { text: original, final: true, since: m.since })
     streams.delete(e.message_id)
     await bumpHeld($)
   }
@@ -954,7 +974,7 @@ async function closeStreams($: EngineInterface) {
   let any = false
   for (const [id, m] of streams) {
     if (m.verdict !== true) continue
-    holdText(m.tag, { text: deltaText(m), final: true })
+    holdText(m.tag, { text: deltaText(m), final: true, since: m.since })
     streams.delete(id)
     any = true
   }
@@ -1047,7 +1067,8 @@ export function registerFormat(on: On) {
       const trigger = settingOf(await read($, fmtTrigger), TRIGGERS, DEFAULT_TRIGGER)
       if ((trigger === 'auto' || marked) && (await read($, fmtOn)) === true && (await read($, fmtRaw)) !== true && (await read($, fmtPause)) == null) {
         // The claim is taken here, before the turn is marked as ended, so the row goes from the streaming placeholder to the pending one with no plain text between.
-        const claimed = await claimEntry($, keyOf(text), false)
+        // Its counter keeps the time since the turn began, which is what the streaming row showed.
+        const claimed = await claimEntry($, keyOf(text), false, (await read($, fmtTurn))?.at ?? undefined)
         $.clock.after(0, () => void convert($, text, seq, false, claimed).catch(() => undefined))
       }
       return done
@@ -1067,11 +1088,14 @@ export function registerFormat(on: On) {
     const tag = untag(rowText)
     let original = rowText
     let streaming = false
+    // When the work on this row began (its first flush): its counter runs from here, whatever the row is waiting for.
+    let begun: number | undefined
     if (tag !== null) {
       await read($, fmtHeld)
       const h = held.get(tag)
       original = h?.final && h.text !== null ? h.text : stripTag(rowText)
       streaming = h !== undefined && !h.final
+      begun = h?.since
     }
     const orchestrator = (await read($, fmtOrch)) === true
     const { marked, text } = stripMark(original)
@@ -1081,7 +1105,7 @@ export function registerFormat(on: On) {
     if ((await read($, fmtOn)) !== true || (await read($, fmtRaw)) === true) return asIs()
     const el = $.ui.resolve(e)
     // The original is not complete yet: the placeholder, counting from the start of the turn.
-    if (streaming) return drawPlaceholder(el, await read($, fmtFrame), (await read($, fmtTurn)).at ?? undefined)
+    if (streaming) return drawPlaceholder(el, await read($, fmtFrame), begun ?? (await read($, fmtTurn)).at ?? undefined)
     const key = keyOf(text)
     if ((await readMark($, key)) === true) return asIs()
     const entry = await readEntry($, key)
@@ -1102,14 +1126,14 @@ export function registerFormat(on: On) {
       )
     }
     if (entry?.state === 'kept') return asWritten(entry.reason)
-    if (entry?.state === 'pending') return drawPlaceholder(el, await read($, fmtFrame), entry.since)
+    if (entry?.state === 'pending') return drawPlaceholder(el, await read($, fmtFrame), begun ?? entry.since)
     const pause = await read($, fmtPause)
     if (pause != null) return asWritten(`paused: ${pause}`)
     // No entry: still streaming when it began in the turn that runs now. A marked reply from an earlier turn, or from before
     // this session, that never got an entry is as written; it must not spin.
     const turn = await read($, fmtTurn)
     const bornAt = bornIn(e.requestId, turn)
-    if (turn.at != null && bornAt === turn.n) return drawPlaceholder(el, await read($, fmtFrame), turn.at)
+    if (turn.at != null && bornAt === turn.n) return drawPlaceholder(el, await read($, fmtFrame), begun ?? turn.at)
     return asIs()
   })
 }

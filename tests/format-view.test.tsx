@@ -1788,7 +1788,7 @@ test('a pending conversion is the placeholder: frames every 100 ms, whole second
   await ui.unmount()
 })
 
-test('the streaming placeholder counts its seconds from the start of the turn, and a pending one from its claim', async ($, on) => {
+test('the streaming placeholder counts its seconds from the start of the turn, and the pending one goes on from there (no restart at the claim)', async ($, on) => {
   const b = await boot($, on, MARKED_MODE)
   b.w.replies.set(options.source, options.output)
   b.w.delays.set(options.source, 5000)
@@ -1799,9 +1799,9 @@ test('the streaming placeholder counts its seconds from the start of the turn, a
   expect(await texts(ui)).toEqual([spin(20, 2)])
   await finish($, b, first(options.source))
   const row = await show($, first(options.source))
-  expect(await texts(row)).toEqual([spin(20, 0)])
+  expect(await texts(row)).toEqual([spin(20, 2)])
   await b.clock.advance(1000)
-  expect(await texts(row)).toEqual([spin(30, 1)])
+  expect(await texts(row)).toEqual([spin(30, 3)])
   await ui.unmount()
   await row.unmount()
 })
@@ -2536,8 +2536,9 @@ test('the committed row never shows plain text: placeholder, spinner while the f
 test('the row draws again when the final flush files the original, with no timer to do it', async ($, on) => {
   const b = await boot($, on, MARKED_MODE)
   await orchestrate($)
-  // no turn runs, so nothing ticks: only the final flush can move the row
-  const flushes = flushesOf('r-1', REPLY, 3)
+  // no turn runs, so nothing ticks: only the final flush can move the row (a short reply is not converted, so it ends as written)
+  const SHORT = `${MARK}\nAll done, nothing to decide.\nThe checks all pass.\nNothing else is open.`
+  const flushes = flushesOf('r-1', SHORT, 3)
   const results: { displayContent?: string }[] = []
   for (const f of flushes.slice(0, -1)) results.push(await flushOf($, f))
   const ui = await show($, results.map(r => r.displayContent ?? '').join(''))
@@ -2548,7 +2549,8 @@ test('the row draws again when the final flush files the original, with no timer
   await b.clock.settle()
   // an old marked reply with no entry and no turn: as written, marker gone
   expect(await isOriginal(ui)).toBe(true)
-  expect(rowsOf(b).at(-1)).toBe(options.source.trim())
+  expect(rowsOf(b).at(-1)).toBe(SHORT.replace(`${MARK}\n`, ''))
+  expect(b.w.calls).toEqual([])
   await ui.unmount()
 })
 
@@ -2648,4 +2650,132 @@ test('unchanged: a row without a tag (a resumed reply, an unmarked one) draws as
   expect(await isOriginal(plain)).toBe(true)
   await page.unmount()
   await plain.unmount()
+})
+
+// -- each marked block converts at its own final flush (D12), one counter per block (D13) -----------------------------
+
+const secsOf = (t: string | undefined) => Number(/· (\d+)s$/.exec(t ?? '')?.[1] ?? NaN)
+const SECOND = first(INFO_SOURCE)
+
+test('two marked blocks around a slow tool call both convert, each to its own page, and neither spins past its own conversion', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  b.w.delays.set(options.source, 800)
+  b.w.replies.set(INFO_SOURCE, INFO_OUTPUT)
+  b.w.delays.set(INFO_SOURCE, 800)
+  await orchestrate($)
+  await startTurn($, b)
+  const a = await streamReply($, 'blk-a', REPLY)
+  const rowA = await show($, a.row)
+  // block A's original is complete: its conversion starts at once, not at the turn's end
+  await b.clock.advance(100)
+  expect(b.w.calls.map(c => c.prompt)).toEqual([options.source])
+  expect((await texts(rowA))[0]).toMatch(/formatting reply · \ds$/)
+  // a slow tool call: the turn goes on for 5 s with no reply text
+  await b.clock.advance(5000)
+  expect(await isOriginal(rowA)).toBe(false)
+  expect((await texts(rowA)).join('\n')).toContain('Choose how to run the schema migration')
+  expect((await texts(rowA)).join('\n')).not.toContain('formatting reply')
+  // the second block after the tool
+  const c = await streamReply($, 'blk-b', SECOND)
+  const rowB = await show($, c.row)
+  await b.clock.advance(100)
+  expect(b.w.calls.map(x => x.prompt)).toEqual([options.source, INFO_SOURCE])
+  // the turn ends with the second block as its answer: it was claimed at its flush, so nothing is converted twice
+  await finish($, b, SECOND)
+  expect(b.w.calls.map(x => x.prompt)).toEqual([options.source, INFO_SOURCE])
+  await b.clock.advance(2000)
+  expect(b.w.calls.map(x => x.prompt)).toEqual([options.source, INFO_SOURCE])
+  for (const ui of [rowA, rowB]) {
+    expect(await isOriginal(ui)).toBe(false)
+    expect((await texts(ui)).join('\n')).not.toContain('formatting reply')
+  }
+  expect((await texts(rowB)).join('\n')).toContain('is unchanged')
+  expect(rowsOf(b)).toEqual([])
+  // nothing is left running: no pending conversion, no turn, no timer
+  expect(await quiet(b, 3000)).toBe(0)
+  expect(fmtKeys(b).sort()).toEqual(['fmt:index', saved(options.source), saved(INFO_SOURCE)].sort())
+  await rowA.unmount()
+  await rowB.unmount()
+})
+
+test('a block converted at its final flush is not converted again at the turn\'s end, even while its call still runs', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  b.w.delays.set(options.source, 3000)
+  await orchestrate($)
+  await startTurn($, b)
+  const { row } = await streamReply($, 'dd-1', REPLY)
+  const ui = await show($, row)
+  await b.clock.advance(100)
+  expect(b.w.calls).toHaveLength(1)
+  // the turn ends while the call from the final flush runs
+  await $.turn.complete({ answer: REPLY, durationMs: 1, isAborted: false, turnId: `u${turnSeq}`, reason: 'answer' } as never)
+  await b.clock.advance(500)
+  expect(b.w.calls).toHaveLength(1)
+  expect((await texts(ui))[0]).toMatch(/formatting reply · \ds$/)
+  await b.clock.advance(3000)
+  expect(b.w.calls).toHaveLength(1)
+  expect(await isOriginal(ui)).toBe(false)
+  expect((await texts(ui)).join('\n')).not.toContain('formatting reply')
+  // the stats count the answer once
+  expect(await noteOf($)).toContain('formatted 1')
+  expect(await quiet(b, 2000)).toBe(0)
+  await ui.unmount()
+})
+
+test('a block whose conversion failed before the turn ends shows its written text and one reason line, not a spinner', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, { reason: 'api-error' })
+  await orchestrate($)
+  await startTurn($, b)
+  const { row } = await streamReply($, 'ff-1', REPLY)
+  const ui = await show($, row)
+  await b.clock.advance(1000)
+  // the turn still runs (a tool call), yet the block is settled
+  expect(await texts(ui)).toContain(REASON('api-error'))
+  expect((await texts(ui)).join('\n')).not.toContain('formatting reply')
+  expect(rowsOf(b)).toEqual([options.source.trim()])
+  await ui.unmount()
+})
+
+test('the elapsed seconds of one block never decrease: streaming, final flush, pending, page', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  b.w.delays.set(options.source, 3000)
+  await orchestrate($)
+  await startTurn($, b)
+  // the model thinks for 2 s before the reply begins: the counter starts at the reply's first flush
+  await b.clock.advance(2000)
+  const flushes = flushesOf('el-1', REPLY, 3)
+  const results: { displayContent?: string }[] = []
+  for (const f of flushes.slice(0, -1)) results.push(await flushOf($, f))
+  const ui = await show($, results.map(r => r.displayContent ?? '').join(''))
+  const seen: number[] = [secsOf((await texts(ui))[0])]
+  expect(seen[0]).toBe(0)
+  for (let i = 0; i < 12; i++) {
+    await b.clock.advance(250)
+    seen.push(secsOf((await texts(ui))[0]))
+  }
+  // the final flush: the conversion is claimed, the row is the pending one
+  await flushOf($, flushes[flushes.length - 1]!)
+  for (let i = 0; i < 20; i++) {
+    await b.clock.advance(100)
+    const t = (await texts(ui))[0]
+    if (t?.includes('formatting reply')) seen.push(secsOf(t))
+  }
+  // the turn ends: the claim is already taken, the counter goes on
+  await $.turn.complete({ answer: REPLY, durationMs: 1, isAborted: false, turnId: `u${turnSeq}`, reason: 'answer' } as never)
+  for (let i = 0; i < 6; i++) {
+    await b.clock.advance(100)
+    const t = (await texts(ui))[0]
+    if (t?.includes('formatting reply')) seen.push(secsOf(t))
+  }
+  expect(seen.every(n => Number.isFinite(n))).toBe(true)
+  for (let i = 1; i < seen.length; i++) expect([i, seen[i]! >= seen[i - 1]!]).toEqual([i, true])
+  // 3 s of streaming, then the call: the counter passed 3 and 5 on the way
+  expect(Math.max(...seen)).toBeGreaterThanOrEqual(5)
+  await b.clock.advance(3000)
+  expect((await texts(ui)).join('\n')).not.toContain('formatting reply')
+  await ui.unmount()
 })
