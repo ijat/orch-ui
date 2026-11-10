@@ -869,7 +869,7 @@ test('drawing: backticks in the banner, section, card and ask titles are not dra
   const second = await tree($, b, source, output)
   const n = second.nodes
   const banner2 = n.find(x => x.node.props?.backgroundColor === 'permission')?.node as Node
-  const card = n.find(x => x.node.props?.borderStyle === 'round')?.node as Node
+  const card = n.find(x => x.node.props?.borderStyle === 'round' && x.node.props?.borderColor !== 'inactive')?.node as Node
   const cardTitle = (card.children ?? []).find(c => isNode(c) && c.type === 'Text') as Node
   const sections = n.filter(x => x.node.type === 'Text' && x.node.props?.underline === true).map(x => plain(x.node))
   expect([plain(banner2), plain(cardTitle), ...sections]).toEqual([' src/a.ts is unchanged ', 'Check src/a.ts first', 'About src/a.ts', 'Reply go or stop'])
@@ -891,10 +891,22 @@ test('drawing: the do section has its icon in the error color, the ask section i
   await ui.unmount()
 })
 
+test('drawing: the whole reply sits on one rounded page with comfortable padding', async ($, on) => {
+  const b = await boot($, on)
+  const { ui, nodes } = await tree($, b, review.source, review.output)
+  const pages = nodes.filter(x => x.node.type === 'Box' && x.node.props?.borderStyle === 'round' && x.node.props?.borderColor === 'inactive')
+  expect(pages).toHaveLength(1)
+  expect(pages[0]?.node.props).toMatchObject({ flexDirection: 'column', paddingX: 2, paddingY: 1 })
+  // The card is drawn inside the page.
+  const inside = walk(pages[0]?.node as Node).filter(x => x.node.type === 'Box' && x.node.props?.borderStyle === 'round' && x.node.props?.borderColor !== 'inactive')
+  expect(inside).toHaveLength(1)
+  await ui.unmount()
+})
+
 test('drawing: the card is a round border without a background, colored by its worst row, with a plain title', async ($, on) => {
   const b = await boot($, on)
   const { ui, nodes } = await tree($, b, review.source, review.output)
-  const cards = nodes.filter(x => x.node.type === 'Box' && x.node.props?.borderStyle === 'round')
+  const cards = nodes.filter(x => x.node.type === 'Box' && x.node.props?.borderStyle === 'round' && x.node.props?.borderColor !== 'inactive')
   expect(cards).toHaveLength(1)
   const card = cards[0]?.node as Node
   expect(card.props?.backgroundColor).toBeUndefined()
@@ -911,7 +923,7 @@ test('drawing: the card is a round border without a background, colored by its w
   const source = FILLER.repeat(5) + 'The file `src/a.ts` is unchanged.'
   const output = '# [info] `src/a.ts` is unchanged\n\n## [card] Worth knowing\n\n- [good] The file `src/a.ts` is unchanged\n  Work continues as planned and nothing else has changed since the last report.\n- [note] Nothing else changed'
   const second = await tree($, b, source, output)
-  const only = second.nodes.find(x => x.node.props?.borderStyle === 'round')?.node
+  const only = second.nodes.find(x => x.node.props?.borderStyle === 'round' && x.node.props?.borderColor !== 'inactive')?.node
   expect(only?.props?.borderColor).toBe('permission')
   await second.ui.unmount()
 })

@@ -533,8 +533,9 @@ export function drawParts(el: ElementTable<'terminal'>, parts: readonly Part[]) 
 
   const rowDetail = (r: Row) => (r.detail.length ? <Box paddingLeft={2}>{rich(r.detail.join('\n'))}</Box> : null)
 
+  // The whole formatted reply sits on one rounded page, so it reads as a redraw, not as the model's text.
   return (
-    <Box flexDirection="column">
+    <Box flexDirection="column" borderStyle="round" borderColor="inactive" paddingX={2} paddingY={1}>
       {parts.map((p, i) => {
         if (p.kind === 'banner') {
           return (
