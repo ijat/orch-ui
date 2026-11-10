@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { Engine, MockClock } from 'claude-code/testing'
 
-import { FORMAT_SYSTEM, KINDS, LIMITS } from '../hooks/format'
+import { FORMAT_SYSTEM, KINDS, LIMITS, MARK } from '../hooks/format'
 import { FORMAT_TOOL, FORMAT_TOOL_FULL } from '../hooks/format-view'
 import * as cli from './fixtures/format/cli'
 import * as done from './fixtures/format/done'
@@ -33,6 +33,10 @@ type World = {
   // files by path (text and the `ls -ln` mode), what was stat-ed, read and written, every process.run argv, every ui.log message
   files: Map<string, { text: string; mode: string }>; stats: string[]; reads: string[]; written: string[]; runs: string[][]; logs: string[]
   cost: number; lsExit: number; truncated: boolean
+  // the text the engine itself was asked to draw (a row no hook redrew)
+  engineRows: string[]
+  // the description of each tool registered
+  descriptions: string[]
 }
 
 const CLAUDE_BIN = 'claude'
@@ -42,9 +46,13 @@ const argAfter = (argv: string[], flag: string) => argv[argv.indexOf(flag) + 1] 
 async function boot($: Engine, on: On, seed: Record<string, unknown> = { 'opt:format': true }, envVars: Record<string, string> = { HOME: '/home/u' }) {
   const clock = mock.clock(on, { now: Date.parse('2026-11-10T10:00Z') })
   const w: World = {
-    calls: [], tools: [], commands: [], opened: [], store: new Map(Object.entries(seed)), replies: new Map(), delays: new Map(),
-    env: { ...envVars }, envAsked: [], files: new Map(), stats: [], reads: [], written: [], runs: [], logs: [], cost: 0.0061, lsExit: 0, truncated: false,
+    calls: [], tools: [], commands: [], opened: [], store: new Map(Object.entries({ 'opt:format-trigger': 'auto', ...seed })), replies: new Map(), delays: new Map(),
+    env: { ...envVars }, envAsked: [], files: new Map(), stats: [], reads: [], written: [], runs: [], logs: [], cost: 0.0061, lsExit: 0, truncated: false, engineRows: [], descriptions: [],
   }
+  on('ui.render', { component: 'AssistantMessage' }, async (_, e, next) => {
+    w.engineRows.push(e.props.text)
+    return next(e)
+  })
   on('env.get', (_, e) => {
     w.envAsked.push(e.name)
     return { value: w.env[e.name] }
@@ -123,6 +131,7 @@ async function boot($: Engine, on: On, seed: Record<string, unknown> = { 'opt:fo
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('tool.register', (_, e) => {
     w.tools.push(e.name)
+    w.descriptions.push(e.description)
     return { value: { tool: `mcp__orch-ui__${e.name}` } }
   })
   on('store.get', (_, e) => ({ value: w.store.get(e.key) }))
@@ -1014,4 +1023,283 @@ test('a normal session never starts the child, even when the option is on', asyn
   expect(b.w.runs.filter(a => a[0] === 'ls')).toEqual([])
   expect(b.w.stats).toEqual([])
   expect(b.w.written).toEqual([])
+})
+
+// -- trigger, marker, on request ---------------------------------------------------------------------------
+
+const marked = (text: string) => `${text}\n\n${MARK}`
+// `trigger` unset: an empty store (the default is marked); the other tests run in auto.
+const MARKED_MODE = { 'opt:format': true, 'opt:format-trigger': undefined }
+const rowsOf = (b: Booted) => b.w.engineRows
+
+test('the default trigger with an empty store is marked: a marked reply converts from its stripped text, an unmarked one does not', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  b.w.replies.set(done.source, done.output)
+  await orchestrate($)
+  await finish($, b, done.source)
+  expect(b.w.calls).toEqual([])
+  await finish($, b, marked(options.source))
+  expect(b.w.calls).toHaveLength(1)
+  expect(b.w.calls[0]!.prompt).toBe(options.source)
+  // the row of the marked reply (marker and all) is drawn in the format; the unmarked one is not
+  const ui = await show($, marked(options.source))
+  expect(await isOriginal(ui)).toBe(false)
+  const other = await show($, done.source)
+  expect(await isOriginal(other)).toBe(true)
+  await ui.unmount()
+  await other.unmount()
+})
+
+test('auto converts every eligible reply, marked or not, and the marker never reaches the model', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true, 'opt:format-trigger': 'auto' })
+  b.w.replies.set(options.source, options.output)
+  b.w.replies.set(done.source, done.output)
+  await orchestrate($)
+  await finish($, b, done.source)
+  await finish($, b, marked(options.source))
+  expect(b.w.calls.map(c => c.prompt)).toEqual([done.source, options.source])
+  expect(b.w.calls.some(c => c.prompt.includes('orch-ui -->'))).toBe(false)
+})
+
+test('a marked and an unmarked copy of one reply share a key: one call', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  await orchestrate($)
+  await finish($, b, marked(options.source))
+  await finish($, b, marked(options.source))
+  expect(b.w.calls).toHaveLength(1)
+})
+
+test('a marker on an ineligible reply starts nothing and is not the latest', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  await orchestrate($)
+  await finish($, b, marked('Short.'))
+  await finish($, b, marked(options.source + '\n```\ncode\n```'))
+  await finish($, b, marked(options.source), { agentId: 'sub-1' })
+  expect(b.w.calls).toEqual([])
+  expect(resultOf(await callTool($, { format: 'formatted' }))).toContain('no reply to format')
+  expect(b.w.calls).toEqual([])
+})
+
+test('the row note counts marked replies and requests in marked mode', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  b.w.replies.set(done.source, done.output)
+  await orchestrate($)
+  const pane = await settingsPane($)
+  expect((await optionRow(pane)).note).toBeUndefined()
+  await finish($, b, marked(options.source))
+  expect((await optionRow(pane)).note).toBe('formatted 1 · as written 0 · marked 1 of 1 · asked 0 · last: ok (short/opus) · api $0.01')
+  await finish($, b, done.source)
+  expect((await optionRow(pane)).note).toBe('formatted 1 · as written 0 · marked 1 of 2 · asked 0 · last: ok (short/opus) · api $0.01')
+  await callTool($, { format: 'formatted' })
+  await b.clock.settle()
+  expect((await optionRow(pane)).note).toBe('formatted 2 · as written 0 · marked 1 of 2 · asked 1 · last: ok (short/opus) · api $0.01')
+  await pane.unmount()
+})
+
+test('in auto the note does not count marks', async ($, on) => {
+  const b = await boot($, on)
+  b.w.replies.set(options.source, options.output)
+  await orchestrate($)
+  await finish($, b, marked(options.source))
+  expect(await noteOf($)).toBe('formatted 1 · as written 0 · last: ok (short/opus) · api $0.01')
+})
+
+// -- the marker on screen ------------------------------------------------------------------------------------
+
+test('a marked row is drawn without its marker line when it is not converted: option off, marked mode unmarked, other surfaces, summaries', async ($, on) => {
+  const b = await boot($, on, {})
+  const text = `${done.source}\n\n${MARK}\n`
+  const ui = await show($, text)
+  expect(rowsOf(b)).toEqual([done.source])
+  await ui.unmount()
+  // an orchestrator session with the option off
+  await orchestrate($)
+  const again = await show($, text)
+  expect(rowsOf(b)).toEqual([done.source, done.source])
+  await again.unmount()
+  // a summary and a desktop row lose it too
+  const summary = await show($, text, { isSummary: true })
+  const desktop = await $.ui.mount({ plugin: 'orch-ui', surface: 'desktop', component: 'AssistantMessage', requestId: 'd9', props: { text, isFirstOfReply: true } })
+  expect(rowsOf(b).slice(2)).toEqual([done.source, done.source])
+  await summary.unmount()
+  await desktop.unmount()
+})
+
+test('a normal session: only the marker line goes, a marker elsewhere and every other row pass untouched', async ($, on) => {
+  const b = await boot($, on)
+  const rows = [
+    `Plain reply.\n\n${MARK}`,
+    `Plain reply.\n${MARK}\nmore text`,
+    `${MARK}\nPlain reply.`,
+    `Plain ${MARK}`,
+    'A reply with no marker at all.',
+    'Streaming reply\n<!-- or',
+  ]
+  for (const text of rows) {
+    const ui = await show($, text)
+    await ui.unmount()
+  }
+  expect(rowsOf(b)).toEqual(['Plain reply.', rows[1], rows[2], rows[3], rows[4], rows[5]])
+  expect(b.w.calls).toEqual([])
+  expect(formatTools(b.w)).toEqual([])
+})
+
+test('a half-written marker is hidden while an orchestrator reply streams, and not in a normal session', async ($, on) => {
+  const b = await boot($, on)
+  const normal = await show($, 'Streaming reply\n\n<!-- orch-')
+  await normal.unmount()
+  expect(rowsOf(b)).toEqual(['Streaming reply\n\n<!-- orch-'])
+  await orchestrate($)
+  const ui = await show($, 'Streaming reply\n\n<!-- orch-')
+  await ui.unmount()
+  const short = await show($, 'Streaming reply\n<!-')
+  await short.unmount()
+  expect(rowsOf(b).slice(1)).toEqual(['Streaming reply', 'Streaming reply\n<!-'])
+})
+
+// -- format that ---------------------------------------------------------------------------------------------
+
+const FORMATTED_AGAIN = 'Formatted again'
+
+test('"formatted" converts the latest reply that was left as written, once', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  await orchestrate($)
+  await finish($, b, options.source)
+  expect(b.w.calls).toEqual([])
+  const ui = await show($, options.source)
+  expect(await isOriginal(ui)).toBe(true)
+  const r = resultOf(await callTool($, { format: 'formatted' }))
+  expect(r).toContain(FORMATTED_AGAIN)
+  expect(r).toContain('Latest reply: formatting the latest reply now.')
+  await b.clock.settle()
+  expect(b.w.calls).toHaveLength(1)
+  expect(await isOriginal(ui)).toBe(false)
+  // done: nothing more
+  expect(resultOf(await callTool($, { format: 'formatted', scope: 'session' }))).toContain('Latest reply: already formatted.')
+  await b.clock.settle()
+  expect(b.w.calls).toHaveLength(1)
+  await ui.unmount()
+})
+
+test('"formatted" is a conversion like any other: no second call while it runs, and one claim per text', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  b.w.delays.set(options.source, 5000)
+  await orchestrate($)
+  await finish($, b, options.source)
+  expect(resultOf(await callTool($, { format: 'formatted' }))).toContain('formatting the latest reply now')
+  await b.clock.settle()
+  expect(resultOf(await callTool($, { format: 'formatted' }))).toContain('it is being formatted already')
+  await b.clock.advance(5000)
+  expect(b.w.calls).toHaveLength(1)
+  expect(resultOf(await callTool($, { format: 'formatted' }))).toContain('already formatted')
+})
+
+test('"formatted" gives a reply that ended as written one more try, then says so', async ($, on) => {
+  const b = await boot($, on)
+  b.w.replies.set(options.source, 'Not in the format at all.')
+  await orchestrate($)
+  await finish($, b, options.source)
+  expect(b.w.calls).toHaveLength(1)
+  expect(await noteOf($)).toBe('formatted 0 · as written 1 · last: no-banner (short/opus) · api $0.01')
+  // the retry fails again: still one reply written as written, not two
+  expect(resultOf(await callTool($, { format: 'formatted' }))).toContain('formatting the latest reply now')
+  await b.clock.settle()
+  expect(b.w.calls).toHaveLength(2)
+  expect(await noteOf($)).toBe('formatted 0 · as written 1 · last: no-banner (short/opus) · api $0.01')
+  expect(resultOf(await callTool($, { format: 'formatted' }))).toContain('tried once more already and stays as written')
+  await b.clock.settle()
+  expect(b.w.calls).toHaveLength(2)
+})
+
+test('"formatted" after a failure that clears: the retry draws the reply and the count moves from written to formatted', async ($, on) => {
+  const b = await boot($, on)
+  b.w.replies.set(options.source, 'Not in the format at all.')
+  await orchestrate($)
+  await finish($, b, options.source)
+  const ui = await show($, options.source)
+  expect(await isOriginal(ui)).toBe(true)
+  b.w.replies.set(options.source, options.output)
+  await callTool($, { format: 'formatted' })
+  await b.clock.settle()
+  expect(await isOriginal(ui)).toBe(false)
+  expect(await noteOf($)).toBe('formatted 1 · as written 0 · last: ok (short/opus) · api $0.01')
+  await ui.unmount()
+})
+
+test('"formatted" takes the newest reply by turn.complete order, and an ineligible one is not a reply to format', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  b.w.replies.set(options.source, options.output)
+  b.w.replies.set(done.source, done.output)
+  await orchestrate($)
+  await finish($, b, options.source)
+  await finish($, b, done.source)
+  await finish($, b, 'Short.')
+  await callTool($, { format: 'formatted' })
+  await b.clock.settle()
+  expect(b.w.calls.map(c => c.prompt)).toEqual([done.source])
+  // an older one cannot be asked for
+  const old = await show($, options.source)
+  expect(await isOriginal(old)).toBe(true)
+  await old.unmount()
+})
+
+test('"formatted" says why and makes no call when formatting is off or paused, or there is nothing to format', async ($, on) => {
+  const off = await boot($, on, { 'opt:format': false })
+  await orchestrate($)
+  await finish($, off, options.source)
+  expect(resultOf(await callTool($, { format: 'formatted' }))).toBe("Formatting is off in orch-ui's settings (/orch-ui); nothing changed.")
+  expect(off.w.calls).toEqual([])
+})
+
+test('"formatted" while paused makes no call', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE, { HOME: '/home/u', CLAUDE_CODE_USE_BEDROCK: '1' })
+  await orchestrate($)
+  await finish($, b, marked(options.source))
+  expect(await noteOf($)).toContain('paused: cloud-provider')
+  const r = resultOf(await callTool($, { format: 'formatted' }))
+  expect(r).toContain('Latest reply: paused: cloud-provider.')
+  await b.clock.settle()
+  expect(b.w.runs.filter(a => a[0] === 'claude')).toEqual([])
+})
+
+test('"formatted" with no reply yet, and in a session that never loaded the skill', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  expect(formatTools(b.w)).toEqual([])
+  await orchestrate($)
+  expect(resultOf(await callTool($, { format: 'formatted' }))).toContain('Latest reply: no reply to format.')
+})
+
+test('"formatted" in auto converts the latest reply that was sent during a session-wide raw', async ($, on) => {
+  const b = await boot($, on)
+  b.w.replies.set(options.source, options.output)
+  await orchestrate($)
+  await callTool($, { format: 'raw', scope: 'session' })
+  await finish($, b, options.source)
+  expect(b.w.calls).toEqual([])
+  expect(resultOf(await callTool($, { format: 'formatted' }))).toContain('formatting the latest reply now')
+  await b.clock.settle()
+  expect(b.w.calls).toHaveLength(1)
+  const ui = await show($, options.source)
+  expect(await isOriginal(ui)).toBe(false)
+  await ui.unmount()
+})
+
+test('/clear forgets the latest reply', async ($, on) => {
+  const b = await boot($, on, MARKED_MODE)
+  await orchestrate($)
+  await finish($, b, options.source)
+  await $.session.end({ reason: 'clear', sessionId: 's1' } as never)
+  await orchestrate($)
+  expect(resultOf(await callTool($, { format: 'formatted' }))).toContain('no reply to format')
+})
+
+test('the raw tool\'s description names "format that" and forbids writing the reply again', async ($, on) => {
+  const b = await boot($, on)
+  await orchestrate($)
+  expect(b.w.descriptions.some(d => d.includes('"format that"') && d.includes('never write the reply again'))).toBe(true)
 })

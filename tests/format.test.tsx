@@ -2,7 +2,8 @@ import { expect, test } from 'claude-code/testing'
 
 import {
   DEFAULT_BILLING, DEFAULT_EFFORT, DEFAULT_KEY_SOURCE, DEFAULT_MODEL, EFFORTS, FORMAT_SYSTEM, KINDS, LIMITS, MODELS, PAUSE_REASONS,
-  cliArgs, cliEnv, contrast, eligible, formatOnce, identifiers, keyFileModeOk, kindOf, limits, parseKeyFile, route, validate, verifyRun,
+  MARK, cliArgs, cliEnv, contrast, eligible, endsWithPartialMark, formatOnce, hidePartialMark, identifiers, keyFileModeOk, kindOf, limits, parseKeyFile, route,
+  stripMark, validate, verifyRun,
 } from '../hooks/format'
 import type { CallOutcome, CallRequest } from '../hooks/format'
 import * as cli from './fixtures/format/cli'
@@ -596,4 +597,60 @@ test('keyFileModeOk: only a regular file whose group and other bits are empty', 
   expect(keyFileModeOk('', 0)).toBe(false)
   expect(keyFileModeOk('ls: /x: No such file or directory\n', 0)).toBe(false)
   expect(keyFileModeOk(undefined as never, 0)).toBe(false)
+})
+
+// -- the marker -----------------------------------------------------------------------------------------
+
+test('MARK is the one comment line', () => {
+  expect(MARK).toBe('<!-- orch-ui -->')
+})
+
+test('stripMark: marked only when the last non-blank line is the marker, and then it and the blank lines before it go', () => {
+  const cases: [string, string, boolean, string][] = [
+    ['the last line', `body\n${MARK}`, true, 'body'],
+    ['a final newline', `body\n${MARK}\n`, true, 'body'],
+    ['blank lines after it', `body\n${MARK}\n\n  \n`, true, 'body'],
+    ['blank lines before it', `body\n\n\n${MARK}`, true, 'body'],
+    ['spaces around it', `body\n   ${MARK}   `, true, 'body'],
+    ['a tab around it', `body\n\t${MARK}\t`, true, 'body'],
+    ['several lines above', `one\n\ntwo\n- three\n${MARK}`, true, 'one\n\ntwo\n- three'],
+    ['trailing spaces on the last content line stay', `body  \n${MARK}`, true, 'body  '],
+    ['only the marker', MARK, true, ''],
+    ['the marker and blanks', `\n\n${MARK}\n`, true, ''],
+    ['mid-text', `one\n${MARK}\ntwo`, false, `one\n${MARK}\ntwo`],
+    ['the first line only', `${MARK}\nbody`, false, `${MARK}\nbody`],
+    ['inline at the end of a line', `body ${MARK}`, false, `body ${MARK}`],
+    ['inline before text', `${MARK} body`, false, `${MARK} body`],
+    ['twice: the last is stripped, the first stays', `${MARK}\nbody\n${MARK}`, true, `${MARK}\nbody`],
+    ['a different comment', 'body\n<!-- other -->', false, 'body\n<!-- other -->'],
+    ['a case change', 'body\n<!-- ORCH-UI -->', false, 'body\n<!-- ORCH-UI -->'],
+    ['no marker', 'body', false, 'body'],
+    ['empty', '', false, ''],
+  ]
+  for (const [name, text, marked, out] of cases) expect([name, stripMark(text)]).toEqual([name, { marked, text: out }])
+})
+
+test('endsWithPartialMark: the last line is the start of the marker, 4 characters or more', () => {
+  const cases: [string, string, boolean][] = [
+    ['four characters', 'body\n<!--', true],
+    ['five', 'body\n<!-- ', true],
+    ['most of it', `body\n${MARK.slice(0, -1)}`, true],
+    ['all of it', `body\n${MARK}`, true],
+    ['alone', '<!-- or', true],
+    ['indented', 'body\n  <!-- orch', true],
+    ['three characters', 'body\n<!-', false],
+    ['a final newline', 'body\n<!-- or\n', false],
+    ['a mismatch', 'body\n<!-- orch-uj', false],
+    ['more after it', `body\n${MARK} x`, false],
+    ['mid-text', '<!-- or\nbody', false],
+    ['empty', '', false],
+    ['plain text', 'body\nmore', false],
+  ]
+  for (const [name, text, want] of cases) expect([name, endsWithPartialMark(text)]).toEqual([name, want])
+})
+
+test('hidePartialMark: drops the last line and the blank lines before it', () => {
+  expect(hidePartialMark('body\n\n<!-- or')).toBe('body')
+  expect(hidePartialMark('one\ntwo\n<!--')).toBe('one\ntwo')
+  expect(hidePartialMark('<!-- or')).toBe('')
 })

@@ -3,11 +3,12 @@
 import { atom, read, update } from 'claude-code'
 import type { ElementTable, EngineInterface, On, RenderChildren } from 'claude-code'
 
-import type { Billing, FmtEntry, FmtOrderItem, FmtStats, KeySource } from '../types'
+import type { Billing, FmtEntry, FmtLatest, FmtOrderItem, FmtStats, KeySource, Trigger } from '../types'
 import { formatCall } from './format-call'
 import type { CallSeen } from './format-call'
 import {
-  DEFAULT_BILLING, DEFAULT_EFFORT, DEFAULT_KEY_SOURCE, DEFAULT_MODEL, EFFORTS, KINDS, MODELS, PAUSE_REASONS, formatOnce, kindOf, route,
+  DEFAULT_BILLING, DEFAULT_EFFORT, DEFAULT_KEY_SOURCE, DEFAULT_MODEL, EFFORTS, KINDS, MODELS, PAUSE_REASONS, endsWithPartialMark, formatOnce, hidePartialMark,
+  kindOf, route, stripMark,
 } from './format'
 import type { Kind, Part, Route, Row, RowTag } from './format'
 import { textKey } from './lib'
@@ -16,10 +17,13 @@ const SKILL = 'orchestrate'
 export const FORMAT_TOOL = 'set_message_format'
 export const FORMAT_TOOL_FULL = 'mcp__orch-ui__set_message_format'
 const OPT_KEY = 'opt:format'
+const DEFAULT_TRIGGER = 'marked'
+const TRIGGERS = ['marked', 'auto'] as const
 const OPT_MODEL = 'opt:format-model'
 const OPT_EFFORT = 'opt:format-effort'
 const OPT_BILLING = 'opt:format-billing'
 const OPT_KEY_SOURCE = 'opt:format-key'
+const OPT_TRIGGER = 'opt:format-trigger'
 
 // -- state -----------------------------------------------------------------------------------------
 // The option (also kept in $.store) and what one session knows. Nothing but the option outlives the session.
@@ -34,7 +38,10 @@ const fmtSeq = atom({ plugin: 'orch-ui', key: 'fmtSeq' } as const, 0)
 const EMPTY_ORDER: FmtOrderItem[] = []
 // The keys that received a valid entry, oldest turn first.
 const fmtOrder = atom({ plugin: 'orch-ui', key: 'fmtOrder' } as const, EMPTY_ORDER)
-const EMPTY_STATS: FmtStats = { formatted: 0, kept: 0, last: null, spentUsd: 0, billing: null, viaBaseUrl: false }
+const EMPTY_STATS: FmtStats = { formatted: 0, kept: 0, last: null, spentUsd: 0, billing: null, viaBaseUrl: false, eligible: 0, marked: 0, asked: 0 }
+// A stored value of another shape reads as the empty counts.
+const isStats = (s: unknown): s is FmtStats =>
+  typeof s === 'object' && s !== null && ['formatted', 'kept', 'spentUsd', 'eligible', 'marked', 'asked'].every(k => typeof (s as Record<string, unknown>)[k] === 'number')
 const fmtStats = atom({ plugin: 'orch-ui', key: 'fmtStats' } as const, EMPTY_STATS)
 // The settings, also kept in $.store (loaded at session start; a stored value of another kind reads as the default).
 const fmtModel = atom({ plugin: 'orch-ui', key: 'fmtModel' } as const, DEFAULT_MODEL as string)
@@ -44,6 +51,9 @@ const fmtKey = atom({ plugin: 'orch-ui', key: 'fmtKey' } as const, DEFAULT_KEY_S
 // The reason formatting stopped for this session (a credential, model or setup failure), else null. Only a
 // settings press, a settings change or /clear clears it.
 const fmtPause = atom({ plugin: 'orch-ui', key: 'fmtPause' } as const, null as string | null)
+const fmtTrigger = atom({ plugin: 'orch-ui', key: 'fmtTrigger' } as const, DEFAULT_TRIGGER as Trigger)
+// The newest eligible reply of this session, converted or not (what "format that" means).
+const fmtLatest = atom({ plugin: 'orch-ui', key: 'fmtLatest' } as const, null as FmtLatest | null)
 
 // One entry and one raw mark per message, by the key of its text.
 // The reference is written out in each call: the scan that lists what a module reads and writes needs literal
@@ -61,7 +71,7 @@ async function orderOf($: EngineInterface): Promise<FmtOrderItem[]> {
 }
 async function statsOf($: EngineInterface): Promise<FmtStats> {
   const v = await read($, fmtStats)
-  return v && typeof v.formatted === 'number' && typeof v.kept === 'number' && typeof v.spentUsd === 'number' ? v : EMPTY_STATS
+  return isStats(v) ? v : EMPTY_STATS
 }
 
 const keyOf = (text: string) => textKey(text.trim())
@@ -75,15 +85,17 @@ const enqueue = ($: EngineInterface, key: string, seq: number) =>
 
 // Records one outcome: the entry, this session's counts and spend, and the last reason. `ran` is what the call
 // reported once it got as far as a run (its billing, and whether a gateway is set); without it the last stays.
-async function record($: EngineInterface, key: string, entry: FmtEntry, seq: number, a: { r: Route; model: string }, reason: string, costUsd: number, ran: CallSeen | null) {
+async function record($: EngineInterface, key: string, entry: FmtEntry, seq: number, a: { r: Route; model: string; retry: boolean }, reason: string, costUsd: number, ran: CallSeen | null) {
   const ok = entry.state === 'done'
   if (ok) await enqueue($, key, seq)
   await changeEntry($, key, () => entry)
   await update($, fmtStats, s => {
-    const cur = s && typeof s.formatted === 'number' && typeof s.kept === 'number' && typeof s.spentUsd === 'number' ? s : EMPTY_STATS
+    const cur = isStats(s) ? s : EMPTY_STATS
     return {
+      ...cur,
       formatted: cur.formatted + (ok ? 1 : 0),
-      kept: cur.kept + (ok ? 0 : 1),
+      // a second try of a reply already counted as written is not counted twice
+      kept: Math.max(0, cur.kept + (ok ? 0 : 1) - (a.retry ? 1 : 0)),
       last: { reason, kind: a.r.kind, model: a.model },
       spentUsd: cur.spentUsd + costUsd,
       billing: ran ? ran.billing : cur.billing,
@@ -98,7 +110,7 @@ const settingOf = <T extends string>(v: unknown, allowed: readonly T[], fallback
 
 // Asks for the rewrite of one reply (one `claude -p` call) and records the outcome. Anything that is not a valid
 // rewrite leaves the original on screen and records why.
-async function convert($: EngineInterface, text: string, seq: number) {
+async function convert($: EngineInterface, text: string, seq: number, retry = false) {
   const source = text.trim()
   const r = route(source)
   if (!r) return
@@ -108,8 +120,9 @@ async function convert($: EngineInterface, text: string, seq: number) {
   if ((await read($, fmtRaw)) || !(await read($, fmtOn)) || (await read($, fmtPause)) != null) return
   let claimed = false
   await changeEntry($, key, cur => {
-    claimed = cur === undefined
-    return cur ?? PENDING
+    // A request may take one more try at a reply whose first try ended as written.
+    claimed = cur === undefined || (retry && cur.state === 'kept')
+    return claimed ? PENDING : (cur as FmtEntry)
   })
   if (!claimed) {
     // The same text again: its entry stands, and it becomes the newest message.
@@ -126,10 +139,10 @@ async function convert($: EngineInterface, text: string, seq: number) {
     formatCall($, req, { billing, keySource }, { seen: info => { ran = info } }))
   if (!res.ok) {
     if ((PAUSE_REASONS as readonly string[]).includes(res.reason)) await update($, fmtPause, () => res.reason)
-    await record($, key, { state: 'kept', kind: r.kind, reason: res.reason }, seq, { r, model }, res.reason, res.costUsd, ran)
+    await record($, key, { state: 'kept', kind: r.kind, reason: res.reason }, seq, { r, model, retry }, res.reason, res.costUsd, ran)
     return
   }
-  await record($, key, { state: 'done', kind: r.kind, parts: res.parts }, seq, { r, model }, 'ok', res.costUsd, ran)
+  await record($, key, { state: 'done', kind: r.kind, parts: res.parts }, seq, { r, model, retry }, 'ok', res.costUsd, ran)
 }
 
 // -- raw -------------------------------------------------------------------------------------------
@@ -158,6 +171,31 @@ async function resetSession($: EngineInterface) {
   await update($, fmtOrch, () => false)
   await update($, fmtOrder, () => EMPTY_ORDER)
   await update($, fmtStats, () => EMPTY_STATS)
+  await update($, fmtLatest, () => null)
+}
+
+// "Format that": converts the session's latest eligible reply when it was left as written. Only that reply; an older
+// one cannot be asked for. No entry yet starts a conversion, a reply that ended as written gets one more try, a done or
+// running one is left alone. Paused formatting makes no call. It starts like any conversion, on a timer.
+async function formatLatest($: EngineInterface): Promise<string> {
+  const pause = await read($, fmtPause)
+  if (pause != null) return `paused: ${pause}`
+  const latest = await read($, fmtLatest)
+  if (!latest) return 'no reply to format'
+  const entry = await readEntry($, latest.key)
+  if (entry?.state === 'done') return 'already formatted'
+  if (entry?.state === 'pending') return 'it is being formatted already'
+  if (entry?.state === 'kept') {
+    if (latest.retried) return 'it was tried once more already and stays as written'
+    await update($, fmtLatest, l => (l ? { ...l, retried: true } : l))
+  }
+  await update($, fmtStats, s => {
+    const cur = isStats(s) ? s : EMPTY_STATS
+    return { ...cur, asked: cur.asked + 1 }
+  })
+  const retry = entry !== undefined
+  $.clock.after(0, () => void convert($, latest.text, latest.seq, retry).catch(() => undefined))
+  return 'formatting the latest reply now'
 }
 
 const OFF_TEXT = "Formatting is off in orch-ui's settings (/orch-ui); nothing changed."
@@ -172,7 +210,8 @@ async function setFormat($: EngineInterface, e: Record<string, unknown>): Promis
 
   if (format === 'formatted') {
     await clearRaw($)
-    return { result: 'Formatted again: the session-wide raw mode and every message shown as written are cleared (scope ignored). New and earlier formatted messages are drawn formatted.' }
+    const base = 'Formatted again: the session-wide raw mode and every message shown as written are cleared (scope ignored). New and earlier formatted messages are drawn formatted.'
+    return { result: `${base} Latest reply: ${await formatLatest($)}.` }
   }
   if (scope === 'session') {
     await update($, fmtRaw, () => true)
@@ -190,6 +229,7 @@ const FORMAT_TOOL_DESCRIPTION = 'Show orch-ui\'s formatted redraw of your replie
   + '(for example "show raw", "give me unfiltered", "turn off orch-ui", "bring the formatting back"), never because something was unclear: "I don\'t get it" means explain better, not call this. '
   + 'format "raw" shows messages as written, "formatted" restores the formatting. scope "latest" (the default) affects only the newest formatted message, and the next message is formatted again; '
   + 'use it unless the user\'s words cover more than the last message. scope "session" for "turn off orch-ui", "stop formatting", "keep it raw", "for the rest of the session", "all messages". '
+  + 'format "formatted" also formats your latest reply if it was left as written: "format that" or "show that in orch-ui" mean call it with "formatted", and never write the reply again. '
   + 'It changes how replies are drawn only, never the stored text, and not the stored option.'
 
 async function registerTool($: EngineInterface) {
@@ -233,6 +273,7 @@ export async function loadFormat($: EngineInterface) {
   await load(OPT_EFFORT, EFFORTS, DEFAULT_EFFORT, v => update($, fmtEffort, () => v))
   await load(OPT_BILLING, BILLINGS, DEFAULT_BILLING, v => update($, fmtBilling, () => v))
   await load(OPT_KEY_SOURCE, KEY_SOURCES, DEFAULT_KEY_SOURCE, v => update($, fmtKey, () => v))
+  await load(OPT_TRIGGER, TRIGGERS, DEFAULT_TRIGGER, v => update($, fmtTrigger, () => v))
 }
 
 // What the row shows: the option, and a note on raw state, this session's counts and the last outcome.
@@ -245,6 +286,7 @@ export async function formatRow($: EngineInterface): Promise<{ on: boolean; note
   if (raw) bits.push('raw: this session')
   else if (marked > 0) bits.push(`raw: ${marked} message(s)`)
   if (stats.formatted + stats.kept > 0) bits.push(`formatted ${stats.formatted} · as written ${stats.kept}`)
+  if (stats.eligible > 0 && settingOf(await read($, fmtTrigger), TRIGGERS, DEFAULT_TRIGGER) === 'marked') bits.push(`marked ${stats.marked} of ${stats.eligible}`, `asked ${stats.asked}`)
   if (stats.last) bits.push(`last: ${stats.last.reason} (${stats.last.kind}/${stats.last.model})`)
   if (stats.billing) bits.push(`${stats.billing === 'api' ? 'api' : 'plan'} $${stats.spentUsd.toFixed(2)}`)
   if (stats.viaBaseUrl) bits.push('via ANTHROPIC_BASE_URL')
@@ -434,12 +476,20 @@ export function registerFormat(on: On) {
   // The main loop's finished reply. The work starts on a timer so this hook returns at once.
   on('turn.complete', { reason: 'answer' }, async ($, e, next) => {
     const done = await next(e)
-    if (e.agentId === undefined && route(e.answer) !== null) {
-      if ((await read($, fmtOrch)) === true && (await read($, fmtOn)) === true && (await read($, fmtRaw)) !== true && (await read($, fmtPause)) == null) {
-        const seq = await update($, fmtSeq, n => (n ?? 0) + 1)
-        const text = e.answer
-        $.clock.after(0, () => void convert($, text, seq).catch(() => undefined))
-      }
+    if (e.agentId !== undefined || (await read($, fmtOrch)) !== true) return done
+    // The marker is not part of the reply: it is stripped first, and the key, the route and the source all come from the rest.
+    const { marked, text } = stripMark(e.answer)
+    if (route(text) === null) return done
+    const seq = await update($, fmtSeq, n => (n ?? 0) + 1)
+    // Every eligible reply is the session's latest, whether it is converted or not.
+    await update($, fmtLatest, () => ({ key: keyOf(text), text, seq, retried: false }))
+    await update($, fmtStats, s => {
+      const cur = isStats(s) ? s : EMPTY_STATS
+      return { ...cur, eligible: cur.eligible + 1, marked: cur.marked + (marked ? 1 : 0) }
+    })
+    const trigger = settingOf(await read($, fmtTrigger), TRIGGERS, DEFAULT_TRIGGER)
+    if ((trigger === 'auto' || marked) && (await read($, fmtOn)) === true && (await read($, fmtRaw)) !== true && (await read($, fmtPause)) == null) {
+      $.clock.after(0, () => void convert($, text, seq).catch(() => undefined))
     }
     return done
   })
@@ -447,12 +497,19 @@ export function registerFormat(on: On) {
   on('tool.call', { tool: FORMAT_TOOL_FULL }, async ($, e) => setFormat($, e as unknown as Record<string, unknown>))
 
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
-    if (e.surface !== 'terminal' || e.props.isSummary) return next(e)
-    if ((await read($, fmtOrch)) !== true || (await read($, fmtOn)) !== true || (await read($, fmtRaw)) === true) return next(e)
-    const key = keyOf(e.props.text)
-    if ((await readMark($, key)) === true) return next(e)
+    // The marker line is never shown, in any session and on any surface; a half-written one is hidden while the reply
+    // streams in an orchestrator session. A row without either is passed on untouched.
+    const original = e.props.text
+    const orchestrator = (await read($, fmtOrch)) === true
+    const { marked, text } = stripMark(original)
+    const shown = marked ? text : orchestrator && endsWithPartialMark(original) ? hidePartialMark(original) : original
+    const asIs = () => (shown === original ? next(e) : next({ ...e, props: { ...e.props, text: shown } }))
+    if (e.surface !== 'terminal' || e.props.isSummary) return asIs()
+    if (!orchestrator || (await read($, fmtOn)) !== true || (await read($, fmtRaw)) === true) return asIs()
+    const key = keyOf(text)
+    if ((await readMark($, key)) === true) return asIs()
     const entry = await readEntry($, key)
-    if (entry?.state !== 'done') return next(e)
+    if (entry?.state !== 'done') return asIs()
     return drawParts($.ui.resolve(e), entry.parts)
   })
 }

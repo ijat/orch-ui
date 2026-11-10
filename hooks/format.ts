@@ -510,3 +510,38 @@ export function keyFileModeOk(stdout: string, exitCode: number): boolean {
   const m = /^-[r-][w-][x-]-{6}([@.+]?)\s/.exec(stdout)
   return m !== null && m[1] !== '+'
 }
+
+// -- the marker ---------------------------------------------------------------------------------------
+// The orchestrator ends an important reply with this line (D33). The mod removes it wherever it draws.
+
+export const MARK = '<!-- orch-ui -->'
+
+const lastContent = (lines: string[]): number => {
+  for (let i = lines.length - 1; i >= 0; i--) if ((lines[i] ?? '').trim() !== '') return i
+  return -1
+}
+
+// A text with its marker line removed. Marked only when the last non-blank line, trimmed, is the marker; that line and
+// the blank lines before it go. A marker anywhere else stays in the text and does not count.
+export function stripMark(text: string): { marked: boolean; text: string } {
+  const lines = String(text).split('\n')
+  const at = lastContent(lines)
+  if (at < 0 || (lines[at] ?? '').trim() !== MARK) return { marked: false, text }
+  const keep = lastContent(lines.slice(0, at))
+  return { marked: true, text: lines.slice(0, keep + 1).join('\n') }
+}
+
+// Whether the text ends in the start of a marker line: its last line (nothing after the final newline) is a
+// prefix of the marker, at least 4 characters. Seen while a reply is still streaming.
+export function endsWithPartialMark(text: string): boolean {
+  const lines = String(text).split('\n')
+  const last = (lines[lines.length - 1] ?? '').trimStart()
+  return last.length >= 4 && MARK.startsWith(last)
+}
+
+// The text without that trailing partial line and the blank lines before it.
+export function hidePartialMark(text: string): string {
+  const lines = String(text).split('\n')
+  lines.pop()
+  return lines.slice(0, lastContent(lines) + 1).join('\n')
+}
