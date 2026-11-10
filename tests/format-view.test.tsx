@@ -2,18 +2,20 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { Engine, MockClock } from 'claude-code/testing'
 
-import {
-  FORMAT_SYSTEM, KINDS, LONG_EFFORT, LONG_MAX_TOKENS, LONG_MODEL, LONG_TIMEOUT_MS, SHORT_EFFORT, SHORT_MAX_TOKENS, SHORT_MODEL, SHORT_TIMEOUT_MS,
-} from '../hooks/format'
+import { FORMAT_SYSTEM, KINDS, LIMITS } from '../hooks/format'
 import { FORMAT_TOOL, FORMAT_TOOL_FULL } from '../hooks/format-view'
+import * as cli from './fixtures/format/cli'
 import * as done from './fixtures/format/done'
 import * as long from './fixtures/format/long'
 import * as options from './fixtures/format/options'
 import * as review from './fixtures/format/review'
 
-const USAGE = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
-type Call = { model: string; effort?: string; maxTokens?: number; timeoutMs?: number; system?: string; prompt: string }
-type Reply = string | { reason: 'api-error' | 'empty-reply' | 'aborted' } | { deny: string } | { text: string; tokens: number }
+type Call = {
+  model: string; effort?: string; maxTokens?: number; timeoutMs?: number; system?: string; prompt: string
+  argv: string[]; env: Record<string, string>; cwd?: string
+}
+// What the child prints for one prompt: a rewrite, a failure shape, a refusal of the run, or a run that hits its time limit.
+type Reply = string | { reason: 'api-error' | 'empty-reply' | 'aborted' } | { deny: string } | { text: string; tokens: number } | { stdout: string } | { rejectAfter: number }
 
 // A short source with no digits and one id, and a rewrite of it with an `info` banner.
 const FILLER = 'The work continues as planned and nothing else has changed since the last report. '
@@ -23,13 +25,30 @@ const INFO_OUTPUT = '# [info] `src/a.ts` is unchanged\n\n## [more] Where it stan
 // The compaction tool is there from session start; the formatter's is the one that comes with the marking.
 const formatTools = (w: { tools: string[] }) => w.tools.filter(t => t === FORMAT_TOOL)
 
-type World = { calls: Call[]; tools: string[]; commands: string[]; opened: Record<string, unknown>[]; store: Map<string, unknown>; replies: Map<string, Reply>; delays: Map<string, number> }
+type World = {
+  calls: Call[]; tools: string[]; commands: string[]; opened: Record<string, unknown>[]; store: Map<string, unknown>
+  replies: Map<string, Reply>; delays: Map<string, number>
+  // the host environment the plugin can read, and the names it asked for
+  env: Record<string, string>; envAsked: string[]
+  // files by path (text and the `ls -ln` mode), what was stat-ed, read and written, every process.run argv, every ui.log message
+  files: Map<string, { text: string; mode: string }>; stats: string[]; reads: string[]; written: string[]; runs: string[][]; logs: string[]
+  cost: number; lsExit: number; truncated: boolean
+}
 
-// The engine beneath the plugin: just enough for session.start, the model, the store and the tool registry.
-async function boot($: Engine, on: On, seed: Record<string, unknown> = { 'opt:format': true }) {
+const CLAUDE_BIN = 'claude'
+const argAfter = (argv: string[], flag: string) => argv[argv.indexOf(flag) + 1] ?? ''
+
+// The engine beneath the plugin: just enough for session.start, the child process, the files, the store and the tool registry.
+async function boot($: Engine, on: On, seed: Record<string, unknown> = { 'opt:format': true }, envVars: Record<string, string> = { HOME: '/home/u' }) {
   const clock = mock.clock(on, { now: Date.parse('2026-11-10T10:00Z') })
-  const w: World = { calls: [], tools: [], commands: [], opened: [], store: new Map(Object.entries(seed)), replies: new Map(), delays: new Map() }
-  mock.env(on, { HOME: '/home/u' })
+  const w: World = {
+    calls: [], tools: [], commands: [], opened: [], store: new Map(Object.entries(seed)), replies: new Map(), delays: new Map(),
+    env: { ...envVars }, envAsked: [], files: new Map(), stats: [], reads: [], written: [], runs: [], logs: [], cost: 0.0061, lsExit: 0, truncated: false,
+  }
+  on('env.get', (_, e) => {
+    w.envAsked.push(e.name)
+    return { value: w.env[e.name] }
+  })
   on('session.cwd', () => ({ value: '/proj' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('command.register', (_, e) => {
@@ -41,7 +60,64 @@ async function boot($: Engine, on: On, seed: Record<string, unknown> = { 'opt:fo
     return { value: { isPlaced: true } }
   })
   on('ui.panes', () => ({ value: [] }))
-  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: 'no orch', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('ui.log', (_, e) => {
+    w.logs.push(JSON.stringify(e))
+    return { value: undefined }
+  })
+  on('fs.stat', (_, e) => {
+    w.stats.push(e.path)
+    const f = w.files.get(e.path)
+    return f ? { value: { kind: 'file' as const, size: f.text.length, mtimeMs: 0, isLink: false } } : { deny: 'ENOENT: no such file' }
+  })
+  on('fs.read', (_, e) => {
+    w.reads.push(e.path)
+    const f = w.files.get(e.path)
+    return f ? { value: f.text } : { deny: 'ENOENT: no such file' }
+  })
+  on('fs.write', (_, e) => {
+    w.written.push(e.path)
+    return { value: undefined }
+  })
+  on('process.run', async (_, e) => {
+    w.runs.push([...e.argv])
+    const noRun = { value: { exitCode: 1, stdout: '', stderr: 'no orch', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (e.argv[0] === 'ls') {
+      const f = w.files.get(String(e.argv[e.argv.length - 1]))
+      return { value: { exitCode: w.lsExit, stdout: f ? `${f.mode}  1 501  20  ${f.text.length} Nov 10 10:00 ${e.argv[e.argv.length - 1]}\n` : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    if (e.argv[0] !== CLAUDE_BIN) return noRun
+    const argv = [...e.argv]
+    const env = { ...(e.init?.env ?? {}) }
+    const prompt = e.init?.stdin ?? ''
+    w.calls.push({
+      model: argAfter(argv, '--model'), effort: argAfter(argv, '--effort'), maxTokens: Number(env.CLAUDE_CODE_MAX_OUTPUT_TOKENS), timeoutMs: e.init?.timeoutMs,
+      system: argAfter(argv, '--system-prompt'), prompt, argv, env, cwd: e.init?.cwd,
+    })
+    const delay = w.delays.get(prompt)
+    if (delay) await clock.sleep(delay)
+    const r = w.replies.get(prompt)
+    const api = argv.includes('--bare')
+    const modelId = `claude-${argAfter(argv, '--model')}-5-5`
+    const init = cli.init(api ? 'ANTHROPIC_API_KEY' : 'none', modelId)
+    const used = { modelUsage: { [modelId]: {} }, total_cost_usd: w.cost }
+    const ran = (...lines: object[]) => ({ value: { exitCode: 0, stdout: cli.stream(init, ...lines), stderr: '', isStdoutTruncated: w.truncated, isStderrTruncated: false } })
+    if (r === undefined) return ran(cli.resultOk('', used))
+    if (typeof r === 'string') return ran(cli.resultOk(r, used))
+    if ('deny' in r) return { deny: r.deny }
+    if ('rejectAfter' in r) {
+      await clock.advance(r.rejectAfter)
+      return { deny: 'killed' }
+    }
+    if ('stdout' in r) return { value: { exitCode: 0, stdout: r.stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if ('tokens' in r) return ran(cli.resultOk(r.text, { ...used, usage: { input_tokens: 1, output_tokens: r.tokens } }))
+    if (r.reason === 'api-error') return ran(cli.resultApiError(500, used))
+    if (r.reason === 'aborted') {
+      // The run reaches its time limit: the clock shows it, and the call rejects.
+      await clock.advance(e.init?.timeoutMs ?? 0)
+      return { deny: 'timed out' }
+    }
+    return ran(cli.resultOk('', used))
+  })
   on('turn.complete', () => ({ text: '' }))
   on('skill.prompt', (_, e) => ({ text: e.text }))
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
@@ -59,19 +135,6 @@ async function boot($: Engine, on: On, seed: Record<string, unknown> = { 'opt:fo
     return { value: undefined }
   })
   on('store.keys', () => ({ value: [...w.store.keys()] }))
-  on('model.complete', async (_, e) => {
-    w.calls.push({ model: e.model, effort: e.effort, maxTokens: e.maxTokens, timeoutMs: e.timeoutMs, system: e.system, prompt: e.prompt })
-    const delay = w.delays.get(e.prompt)
-    if (delay) await clock.sleep(delay)
-    const r = w.replies.get(e.prompt)
-    if (r === undefined) return { value: { isAnswered: false as const, reason: 'empty-reply' as const, usage: USAGE } }
-    if (typeof r === 'string') return { value: { isAnswered: true as const, text: r, usage: USAGE } }
-    if ('deny' in r) return { deny: r.deny }
-    if ('tokens' in r) return { value: { isAnswered: true as const, text: r.text, usage: { ...USAGE, output_tokens: r.tokens } } }
-    if (r.reason === 'api-error') return { value: { isAnswered: false as const, reason: 'api-error' as const, status: 500, error: 'server_error' as const, usage: USAGE } }
-    if (r.reason === 'aborted') return { value: { isAnswered: false as const, reason: 'aborted' as const, usage: USAGE } }
-    return { value: { isAnswered: false as const, reason: 'empty-reply' as const, usage: USAGE } }
-  })
   await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
   await clock.settle()
   return { clock, w }
@@ -108,8 +171,12 @@ const optionRow = async (ui: Awaited<ReturnType<typeof settingsPane>>) => {
 const callTool = ($: Engine, input: Record<string, unknown>) => $.tool.call({ tool: FORMAT_TOOL_FULL, ...input } as never)
 const resultOf = (r: { result?: unknown }) => String(r.result ?? '')
 
-const SHORT_ROUTE = { model: SHORT_MODEL, effort: SHORT_EFFORT, maxTokens: SHORT_MAX_TOKENS, timeoutMs: SHORT_TIMEOUT_MS }
-const LONG_ROUTE = { model: LONG_MODEL, effort: LONG_EFFORT, maxTokens: LONG_MAX_TOKENS, timeoutMs: LONG_TIMEOUT_MS }
+// The default settings are opus at low effort; the limits come from LIMITS by length.
+const SHORT_ROUTE = { model: 'opus', effort: 'low', maxTokens: LIMITS.short.low.maxTokens, timeoutMs: LIMITS.short.low.timeoutMs }
+const LONG_ROUTE = { model: 'opus', effort: 'low', maxTokens: LIMITS.long.low.maxTokens, timeoutMs: LIMITS.long.low.timeoutMs }
+const SHORT_MAX_TOKENS = SHORT_ROUTE.maxTokens
+const SHORT_MODEL = SHORT_ROUTE.model
+const LONG_MODEL = LONG_ROUTE.model
 
 // -- conversion --------------------------------------------------------------------------------------
 
@@ -135,7 +202,7 @@ test('a long reply takes the long route and the row note names it', async ($, on
   expect(b.w.calls).toHaveLength(1)
   expect(b.w.calls[0]).toMatchObject({ ...LONG_ROUTE, prompt: long.source })
   const ui = await settingsPane($)
-  expect((await optionRow(ui)).note).toBe(`formatted 1 · as written 0 · last: ok (long/${LONG_MODEL})`)
+  expect((await optionRow(ui)).note).toBe(`formatted 1 · as written 0 · last: ok (long/${LONG_MODEL}) · api $0.01`)
   await ui.unmount()
 })
 
@@ -195,16 +262,16 @@ test('one call per text, however often it comes back', async ($, on) => {
 
 // -- failures leave the original --------------------------------------------------------------------
 
-const FAILS: [string, Reply, string][] = [
-  ['an API error', { reason: 'api-error' }, 'no-answer'],
-  ['an empty reply', { reason: 'empty-reply' }, 'no-answer'],
-  ['a timeout', { reason: 'aborted' }, 'timeout'],
-  ['a model the engine refuses', { deny: 'model not allowed' }, 'refused: orch-ui: $.model.complete: model not allowed'],
-  ['a reply that used its whole cap', { text: options.output, tokens: SHORT_MAX_TOKENS }, 'truncated'],
-  ['a rewrite that fails validation', 'Not in the format at all.', 'no-banner'],
-  ['a rewrite that drops an id', options.output.replace(/`v3\.0\.0`/g, 'the release'), 'missing-id'],
+const FAILS: [string, Reply, string, string][] = [
+  ['an API error', { reason: 'api-error' }, 'api-error', ' · api $0.01'],
+  ['an empty reply', { reason: 'empty-reply' }, 'no-answer', ' · api $0.01'],
+  ['a timeout', { reason: 'aborted' }, 'timeout', ' · api $0.00'],
+  ['a run the engine refuses', { deny: 'run not allowed' }, 'cli-failed', ' · api $0.00'],
+  ['a reply that used its whole cap', { text: options.output, tokens: SHORT_MAX_TOKENS }, 'truncated', ' · api $0.01'],
+  ['a rewrite that fails validation', 'Not in the format at all.', 'no-banner', ' · api $0.01'],
+  ['a rewrite that drops an id', options.output.replace(/`v3\.0\.0`/g, 'the release'), 'missing-id', ' · api $0.01'],
 ]
-for (const [name, reply, reason] of FAILS) {
+for (const [name, reply, reason, tail] of FAILS) {
   test(`${name}: the original stays, the reason is recorded`, async ($, on) => {
     const b = await boot($, on)
     b.w.replies.set(options.source, reply)
@@ -214,7 +281,7 @@ for (const [name, reply, reason] of FAILS) {
     const ui = await show($, options.source)
     expect(await isOriginal(ui)).toBe(true)
     const pane = await settingsPane($)
-    expect((await optionRow(pane)).note).toBe(`formatted 0 · as written 1 · last: ${reason} (short/${SHORT_MODEL})`)
+    expect((await optionRow(pane)).note).toBe(`formatted 0 · as written 1 · last: ${reason} (short/${SHORT_MODEL})${tail}`)
     // The same text is not asked twice.
     await finish($, b, options.source)
     expect(b.w.calls).toHaveLength(1)
@@ -624,4 +691,327 @@ test('drawing: ids, files, urls, versions and issues get their own pill kinds', 
   expect(pill('9be41d07')).toMatchObject({ backgroundColor: KINDS.commit.pill })
   expect(pill('cargo test')).toMatchObject({ backgroundColor: KINDS.code.pill })
   await ui.unmount()
+})
+
+// -- the child process: settings, key, environment, working directory -------------------------------------
+
+const KEY_PATH = '/home/u/.claude/settings.local.json'
+const KEY_FILE = `{\n  "orchUi": { "formatApiKey": "${cli.KEY}" }\n}\n`
+const claudeRuns = (b: Booted) => b.w.runs.filter(a => a[0] === 'claude')
+const lastCall = (b: Booted) => b.w.calls[b.w.calls.length - 1]!
+
+async function convertOne($: Engine, b: Booted, source = options.source, output = options.output) {
+  b.w.replies.set(source, output)
+  await orchestrate($)
+  await finish($, b, source)
+}
+const noteOf = async ($: Engine) => {
+  const pane = await settingsPane($)
+  const note = (await optionRow(pane)).note
+  await pane.unmount()
+  return note
+}
+
+test('settings: model, effort and billing come from the store, and the limits follow the length and effort', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true, 'opt:format-model': 'sonnet', 'opt:format-effort': 'medium', 'opt:format-billing': 'subscription' })
+  await convertOne($, b)
+  expect(b.w.calls).toHaveLength(1)
+  expect(lastCall(b)).toMatchObject({ model: 'sonnet', effort: 'medium', maxTokens: LIMITS.short.medium.maxTokens, timeoutMs: LIMITS.short.medium.timeoutMs, system: FORMAT_SYSTEM, prompt: options.source })
+  expect(lastCall(b).argv.includes('--bare')).toBe(false)
+  b.w.replies.set(long.source, long.output)
+  await finish($, b, long.source)
+  expect(lastCall(b)).toMatchObject({ model: 'sonnet', effort: 'medium', maxTokens: LIMITS.long.medium.maxTokens, timeoutMs: LIMITS.long.medium.timeoutMs })
+  expect(await noteOf($)).toBe('formatted 2 · as written 0 · last: ok (long/sonnet) · plan $0.01')
+})
+
+test('settings: a stored value of another kind reads as the default (opus, low, api, env)', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true, 'opt:format-model': 'fable', 'opt:format-effort': 'max', 'opt:format-billing': 'oauth', 'opt:format-key': 7 })
+  await convertOne($, b)
+  expect(lastCall(b)).toMatchObject(SHORT_ROUTE)
+  expect(lastCall(b).argv.includes('--bare')).toBe(true)
+  expect(b.w.stats).toEqual([])
+})
+
+const BILLING_CASES: [string, Record<string, unknown>][] = [
+  ['api + env', { 'opt:format': true }],
+  ['api + file', { 'opt:format': true, 'opt:format-key': 'file' }],
+  ['subscription', { 'opt:format': true, 'opt:format-billing': 'subscription' }],
+]
+for (const [name, seed] of BILLING_CASES) {
+  test(`billing ${name}: ${name === 'subscription' ? 'no --bare, the key is blanked' : '--bare'}, and ANTHROPIC_AUTH_TOKEN is blank`, async ($, on) => {
+    const b = await boot($, on, seed)
+    b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw-------' })
+    b.w.env.ANTHROPIC_API_KEY = 'sentinel-session-key-000000'
+    b.w.env.ANTHROPIC_AUTH_TOKEN = 'sentinel-bearer-000000'
+    await convertOne($, b)
+    const c = lastCall(b)
+    expect(c.env.ANTHROPIC_AUTH_TOKEN).toBe('')
+    expect(c.argv.includes('--bare')).toBe(name !== 'subscription')
+    if (name === 'subscription') expect(c.env.ANTHROPIC_API_KEY).toBe('')
+    if (name === 'api + env') expect('ANTHROPIC_API_KEY' in c.env).toBe(false)
+    if (name === 'api + file') expect(c.env.ANTHROPIC_API_KEY).toBe(cli.KEY)
+    expect(Object.keys(c.env).sort().filter(k => k !== 'ANTHROPIC_API_KEY')).toEqual(['ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS'])
+    expect(JSON.stringify([c.argv, c.prompt]).includes('sentinel')).toBe(false)
+  })
+}
+
+// Everything a leak could reach: argv of every run, stdin, ui.log, the store, the paths touched, the note, the tool result
+// and the drawn rows. The env of the claude run is the one place the key may be.
+async function visible($: Engine, b: Booted, ui: Ui) {
+  const pane = await settingsPane($)
+  const all = JSON.stringify({
+    runs: b.w.runs, prompts: b.w.calls.map(c => c.prompt), logs: b.w.logs, store: [...b.w.store], written: b.w.written, stats: b.w.stats, reads: b.w.reads,
+    asked: b.w.envAsked, pane: (await pane.findAll({ type: 'Text' })).map(t => t.text), row: await texts(ui), drawn: JSON.stringify(await ui.drawn()),
+    tool: resultOf(await callTool($, { format: 'raw' })) + resultOf(await callTool($, { format: 'formatted' })),
+    envs: b.w.calls.map(c => Object.fromEntries(Object.entries(c.env).filter(([k]) => k !== 'ANTHROPIC_API_KEY'))),
+  })
+  await pane.unmount()
+  return all
+}
+
+test('key file: the key reaches exactly one place, the child\'s ANTHROPIC_API_KEY', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true, 'opt:format-key': 'file' })
+  b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw-------' })
+  await convertOne($, b)
+  expect(b.w.calls).toHaveLength(1)
+  expect(lastCall(b).env.ANTHROPIC_API_KEY).toBe(cli.KEY)
+  expect(lastCall(b).argv.some(a => a.includes(cli.KEY))).toBe(false)
+  expect(lastCall(b).prompt.includes(cli.KEY)).toBe(false)
+  const ui = await show($, options.source)
+  expect(await isOriginal(ui)).toBe(false)
+  const seen = await visible($, b, ui)
+  expect(seen.includes('orch-ui-format') && seen.includes('--system-prompt')).toBe(true) // instrument: the haystack holds what it should
+  expect(seen.includes(cli.KEY)).toBe(false)
+  // the file was checked, then read once, by the paths of D28
+  expect(b.w.stats).toEqual([KEY_PATH])
+  expect(b.w.reads).toEqual([KEY_PATH])
+  expect(b.w.runs.filter(a => a[0] === 'ls')).toEqual([['ls', '-ln', '--', KEY_PATH]])
+  await ui.unmount()
+})
+
+test('key file: it is read again for each call, never kept', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true, 'opt:format-key': 'file' })
+  b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw-------' })
+  await convertOne($, b)
+  b.w.files.set(KEY_PATH, { text: KEY_FILE.replace('000000', '111111'), mode: '-rw-------' })
+  await convertOne($, b, done.source, done.output)
+  expect(b.w.calls.map(c => c.env.ANTHROPIC_API_KEY)).toEqual([cli.KEY, cli.KEY.replace('000000', '111111')])
+  expect(b.w.reads).toEqual([KEY_PATH, KEY_PATH])
+})
+
+test('key source env: the session\'s key and bearer are never read, passed, or shown', async ($, on) => {
+  const SESSION_KEY = 'sentinel-session-key-000000'
+  const BEARER = 'sentinel-bearer-000000'
+  const b = await boot($, on, { 'opt:format': true }, { HOME: '/home/u', ANTHROPIC_API_KEY: SESSION_KEY, ANTHROPIC_AUTH_TOKEN: BEARER })
+  await convertOne($, b)
+  const ui = await show($, options.source)
+  expect(await isOriginal(ui)).toBe(false)
+  expect(b.w.envAsked).not.toContain('ANTHROPIC_API_KEY')
+  expect(b.w.envAsked).not.toContain('ANTHROPIC_AUTH_TOKEN')
+  const c = lastCall(b)
+  expect(JSON.stringify([c.env, c.argv, c.prompt]).includes(SESSION_KEY)).toBe(false)
+  expect(JSON.stringify([c.env, c.argv, c.prompt]).includes(BEARER)).toBe(false)
+  const all = await visible($, b, ui)
+  expect(all.includes(SESSION_KEY)).toBe(false)
+  expect(all.includes(BEARER)).toBe(false)
+  // the only environment names read are the cloud providers, the gateway, and the home folder
+  expect([...new Set(b.w.envAsked)].sort()).toEqual(['ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_USE_VERTEX', 'HOME', 'OS'])
+  await ui.unmount()
+})
+
+const KEY_FAILS: [string, (b: Booted) => void, string][] = [
+  ['a missing file', b => b.w.files.delete(KEY_PATH), 'key-file-missing'],
+  ['group-readable', b => b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw-r-----' }), 'key-file-unsafe'],
+  ['other-readable', b => b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw----r--' }), 'key-file-unsafe'],
+  ['an ACL', b => b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw-------+' }), 'key-file-unsafe'],
+  ['a link', b => b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: 'lrwx------' }), 'key-file-unsafe'],
+  ['a failed ls', b => { b.w.lsExit = 1 }, 'key-file-unsafe'],
+  ['a file over 64 KiB', b => b.w.files.set(KEY_PATH, { text: KEY_FILE + ' '.repeat(65536), mode: '-rw-------' }), 'key-file-unsafe'],
+  ['a key of the wrong length', b => b.w.files.set(KEY_PATH, { text: KEY_FILE.replace(cli.KEY, 'short'), mode: '-rw-------' }), 'key-file-invalid'],
+  ['only the old orchPane object', b => b.w.files.set(KEY_PATH, { text: KEY_FILE.replace('orchUi', 'orchPane'), mode: '-rw-------' }), 'key-file-invalid'],
+]
+for (const [name, setup, reason] of KEY_FAILS) {
+  test(`key file: ${name} is ${reason}, the child never runs and formatting is not paused`, async ($, on) => {
+    const b = await boot($, on, { 'opt:format': true, 'opt:format-key': 'file' })
+    b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw-------' })
+    setup(b)
+    await convertOne($, b)
+    expect(claudeRuns(b)).toEqual([])
+    expect(await noteOf($)).toBe(`formatted 0 · as written 1 · last: ${reason} (short/opus) · api $0.00`)
+    const all = JSON.stringify([b.w.logs, [...b.w.store]])
+    expect(all.includes(cli.KEY)).toBe(false)
+    // not paused: the next reply tries again
+    await convertOne($, b, done.source, done.output)
+    expect(b.w.stats.length).toBeGreaterThanOrEqual(1)
+  })
+}
+
+test('key file: Windows never reads one', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true, 'opt:format-key': 'file' }, { OS: 'Windows_NT', USERPROFILE: 'C:\\Users\\u', HOME: '/home/u' })
+  b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw-------' })
+  await convertOne($, b)
+  expect(claudeRuns(b)).toEqual([])
+  expect(b.w.stats).toEqual([])
+  expect(await noteOf($)).toContain('last: key-file-unsafe')
+})
+
+test('gateway: with the file key a set ANTHROPIC_BASE_URL stops the run before the key file is touched', async ($, on) => {
+  const URL = 'https://user:secret-in-url@gateway.example/v1'
+  const b = await boot($, on, { 'opt:format': true, 'opt:format-key': 'file' }, { HOME: '/home/u', ANTHROPIC_BASE_URL: URL })
+  b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw-------' })
+  await convertOne($, b)
+  expect(claudeRuns(b)).toEqual([])
+  expect(b.w.stats).toEqual([])
+  expect(b.w.reads).toEqual([])
+  expect(b.w.runs.filter(a => a[0] === 'ls')).toEqual([])
+  const note = await noteOf($)
+  expect(note).toBe('formatted 0 · as written 1 · last: base-url-set (short/opus) · paused: base-url-set')
+  expect(JSON.stringify([note, b.w.logs, [...b.w.store]]).includes('secret-in-url')).toBe(false)
+})
+
+for (const [name, seed] of [['api + env', { 'opt:format': true }], ['subscription', { 'opt:format': true, 'opt:format-billing': 'subscription' }]] as const) {
+  test(`gateway: ${name} still runs, and the note says so without showing the value`, async ($, on) => {
+    const URL = 'https://user:secret-in-url@gateway.example/v1'
+    const b = await boot($, on, seed, { HOME: '/home/u', ANTHROPIC_BASE_URL: URL })
+    await convertOne($, b)
+    expect(claudeRuns(b)).toHaveLength(1)
+    const note = await noteOf($)
+    expect(note).toBe(`formatted 1 · as written 0 · last: ok (short/opus) · ${name === 'subscription' ? 'plan' : 'api'} $0.01 · via ANTHROPIC_BASE_URL`)
+    expect(JSON.stringify([note, b.w.logs, [...b.w.store], b.w.calls.map(c => [c.argv, c.prompt])]).includes('secret-in-url')).toBe(false)
+  })
+}
+
+test('gateway: an empty ANTHROPIC_BASE_URL acts as unset', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true, 'opt:format-key': 'file' }, { HOME: '/home/u', ANTHROPIC_BASE_URL: '' })
+  b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw-------' })
+  await convertOne($, b)
+  expect(claudeRuns(b)).toHaveLength(1)
+  expect(await noteOf($)).toBe('formatted 1 · as written 0 · last: ok (short/opus) · api $0.01')
+})
+
+for (const name of ['CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY']) {
+  test(`cloud providers: ${name} stops every run and pauses`, async ($, on) => {
+    const b = await boot($, on, { 'opt:format': true }, { HOME: '/home/u', [name]: '1' })
+    await convertOne($, b)
+    expect(claudeRuns(b)).toEqual([])
+    expect(await noteOf($)).toBe('formatted 0 · as written 1 · last: cloud-provider (short/opus) · paused: cloud-provider')
+  })
+}
+
+test('cloud providers: an empty value does not count', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true }, { HOME: '/home/u', CLAUDE_CODE_USE_BEDROCK: '' })
+  await convertOne($, b)
+  expect(claudeRuns(b)).toHaveLength(1)
+})
+
+test('working directory: under the home folder, never TMPDIR, TEMP or /tmp', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true }, { HOME: '/home/u', TMPDIR: '/tmp/x', TEMP: '/tmp/y' })
+  await convertOne($, b)
+  expect(lastCall(b).cwd).toBe('/home/u/.claude/orch-ui-format')
+  expect(b.w.written).toEqual(['/home/u/.claude/orch-ui-format/.keep'])
+  expect(b.w.envAsked).not.toContain('TMPDIR')
+  expect(b.w.envAsked).not.toContain('TEMP')
+})
+
+test('working directory: Windows uses USERPROFILE with forward slashes', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true }, { OS: 'Windows_NT', USERPROFILE: 'C:\\Users\\u' })
+  await convertOne($, b)
+  expect(lastCall(b).cwd).toBe('C:/Users/u/.claude/orch-ui-format')
+  // the kit resolves a path that is not absolute on this host against the session folder, so only its tail is the plugin's
+  expect(b.w.written.map(w => w.slice(-'C:/Users/u/.claude/orch-ui-format/.keep'.length))).toEqual(['C:/Users/u/.claude/orch-ui-format/.keep'])
+})
+
+test('working directory: no home folder is workdir-failed, a pause, and no run', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true }, { TMPDIR: '/tmp/x' })
+  await convertOne($, b)
+  expect(claudeRuns(b)).toEqual([])
+  expect(await noteOf($)).toBe('formatted 0 · as written 1 · last: workdir-failed (short/opus) · api $0.00 · paused: workdir-failed')
+})
+
+const TIMEOUT_CASES: [string, Reply, string][] = [
+  ['killed at the limit', { rejectAfter: LIMITS.short.low.timeoutMs }, 'timeout'],
+  ['killed 250 ms early on the clock', { rejectAfter: LIMITS.short.low.timeoutMs - 250 }, 'timeout'],
+  ['an early failure whose message says time', { deny: 'the time zone database could not be read' }, 'cli-failed'],
+  ['an early rejection', { rejectAfter: 1000 }, 'cli-failed'],
+  ['just under the slack', { rejectAfter: LIMITS.short.low.timeoutMs - 251 }, 'cli-failed'],
+  ['a missing program', { deny: 'spawn claude ENOENT' }, 'cli-missing'],
+  ['a missing program, said otherwise', { deny: 'claude: command not found' }, 'cli-missing'],
+]
+for (const [name, reply, reason] of TIMEOUT_CASES) {
+  test(`timeouts are told by elapsed time, not by the message: ${name} is ${reason}`, async ($, on) => {
+    const b = await boot($, on)
+    b.w.replies.set(options.source, reply)
+    await orchestrate($)
+    await finish($, b, options.source)
+    expect((await noteOf($))?.includes(`last: ${reason} (`)).toBe(true)
+  })
+}
+
+test('a truncated stdout is cli-output', async ($, on) => {
+  const b = await boot($, on)
+  b.w.truncated = true
+  await convertOne($, b)
+  expect(await noteOf($)).toBe('formatted 0 · as written 1 · last: cli-output (short/opus) · api $0.00')
+})
+
+// -- pause ---------------------------------------------------------------------------------------------
+
+test('a billing mismatch pauses formatting for the session; /clear lifts it', async ($, on) => {
+  const b = await boot($, on)
+  // An api run whose init says "none": a key-less run that fell back to something else.
+  b.w.replies.set(options.source, { stdout: cli.stream(cli.init('none'), cli.resultOk(options.output, { total_cost_usd: 0.0061 })) })
+  await orchestrate($)
+  await finish($, b, options.source)
+  expect(await noteOf($)).toBe('formatted 0 · as written 1 · last: billing-mismatch (short/opus) · api $0.01 · paused: billing-mismatch')
+  b.w.replies.set(done.source, done.output)
+  await finish($, b, done.source)
+  await finish($, b, done.source)
+  expect(b.w.calls).toHaveLength(1)
+  const ui = await show($, done.source)
+  expect(await isOriginal(ui)).toBe(true)
+  await $.session.end({ reason: 'clear', sessionId: 's1' } as never)
+  await orchestrate($)
+  await finish($, b, done.source)
+  expect(b.w.calls).toHaveLength(2)
+  expect(await isOriginal(ui)).toBe(false)
+  expect(await noteOf($)).toBe('formatted 1 · as written 0 · last: ok (short/opus) · api $0.01')
+  await ui.unmount()
+})
+
+const PAUSE_CASES: [string, Reply, string, boolean][] = [
+  ['auth failure', { stdout: cli.stream(cli.init('ANTHROPIC_API_KEY'), cli.resultApiError(401)) }, 'auth-failed', true],
+  ['no credential', { stdout: cli.stream(cli.init('ANTHROPIC_API_KEY'), cli.resultNoCredential()) }, 'no-credential', true],
+  ['a model that is not the one asked', { stdout: cli.stream(cli.init('ANTHROPIC_API_KEY'), cli.resultOk(options.output, { modelUsage: { 'claude-sonnet-5-5': {} } })) }, 'model-mismatch', true],
+  ['a missing program', { deny: 'spawn claude ENOENT' }, 'cli-missing', true],
+  ['a rate limit', { stdout: cli.stream(cli.init('ANTHROPIC_API_KEY'), cli.resultApiError(429)) }, 'rate-limited', false],
+  ['an overload', { stdout: cli.stream(cli.init('ANTHROPIC_API_KEY'), cli.resultApiError(529)) }, 'overloaded', false],
+  ['two result lines', { stdout: cli.stream(cli.init('ANTHROPIC_API_KEY'), cli.resultOk('a'), cli.resultOk('b')) }, 'cli-output', false],
+]
+for (const [name, reply, reason, pauses] of PAUSE_CASES) {
+  test(`${name} (${reason}) ${pauses ? 'pauses formatting' : 'does not pause formatting'}`, async ($, on) => {
+    const b = await boot($, on)
+    b.w.replies.set(options.source, reply)
+    await orchestrate($)
+    await finish($, b, options.source)
+    const note = await noteOf($)
+    expect(note?.includes(`last: ${reason} (`)).toBe(true)
+    expect(note?.includes(`paused: ${reason}`)).toBe(pauses)
+    await finish($, b, done.source)
+    expect(b.w.calls.length).toBe(pauses ? 1 : 2)
+  })
+}
+
+test('a normal session never starts the child, even when the option is on', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true, 'opt:format-key': 'file' })
+  b.w.files.set(KEY_PATH, { text: KEY_FILE, mode: '-rw-------' })
+  b.w.replies.set(options.source, options.output)
+  b.w.replies.set(long.source, long.output)
+  await finish($, b, options.source)
+  await finish($, b, long.source)
+  await $.skill.prompt({ skill: 'commit', text: 'x' })
+  await finish($, b, options.source)
+  expect(claudeRuns(b)).toEqual([])
+  expect(b.w.runs.filter(a => a[0] === 'ls')).toEqual([])
+  expect(b.w.stats).toEqual([])
+  expect(b.w.written).toEqual([])
 })

@@ -1,9 +1,8 @@
 import { expect, test } from 'claude-code/testing'
 
 import {
-  DEFAULT_EFFORT, DEFAULT_MODEL, EFFORTS, FORMAT_SYSTEM, KINDS, LIMITS, LONG_EFFORT, LONG_MAX_TOKENS, LONG_MODEL, LONG_TIMEOUT_MS, MODELS,
-  PAUSE_REASONS, SHORT_EFFORT, SHORT_MAX_TOKENS, SHORT_MODEL, SHORT_TIMEOUT_MS,
-  cliArgs, cliEnv, contrast, eligible, formatOnce, identifiers, kindOf, limits, route, validate, verifyRun,
+  DEFAULT_BILLING, DEFAULT_EFFORT, DEFAULT_KEY_SOURCE, DEFAULT_MODEL, EFFORTS, FORMAT_SYSTEM, KINDS, LIMITS, MODELS, PAUSE_REASONS,
+  cliArgs, cliEnv, contrast, eligible, formatOnce, identifiers, keyFileModeOk, kindOf, limits, parseKeyFile, route, validate, verifyRun,
 } from '../hooks/format'
 import type { CallOutcome, CallRequest } from '../hooks/format'
 import * as cli from './fixtures/format/cli'
@@ -24,8 +23,8 @@ const reasonOf = (source: string, output: string) => {
 
 test('route: length bounds, after trim', () => {
   expect(route(words(299))).toBe(null)
-  const short = { kind: 'short', model: SHORT_MODEL, effort: SHORT_EFFORT, maxTokens: SHORT_MAX_TOKENS, timeoutMs: SHORT_TIMEOUT_MS }
-  const longer = { kind: 'long', model: LONG_MODEL, effort: LONG_EFFORT, maxTokens: LONG_MAX_TOKENS, timeoutMs: LONG_TIMEOUT_MS }
+  const short = { kind: 'short' }
+  const longer = { kind: 'long' }
   expect(route(words(300))).toEqual(short)
   expect(route(words(2000))).toEqual(short)
   expect(route(words(2001))).toEqual(longer)
@@ -285,9 +284,7 @@ test('limits: by length and effort, unknown values read as the default effort an
   expect(limits('long', 'high')).toEqual({ maxTokens: 38000, timeoutMs: 150000 })
   expect(limits('short', 'max')).toEqual(LIMITS.short.low)
   expect(limits('nope' as never, 'low')).toEqual(LIMITS.long.low)
-  // the placeholders of the routes stay below the settings' limits at the same effort
-  expect(SHORT_MAX_TOKENS).toBeLessThanOrEqual(LIMITS.short.low.maxTokens)
-  expect(LONG_MAX_TOKENS).toBeLessThanOrEqual(LIMITS.long.low.maxTokens)
+  expect([DEFAULT_BILLING, DEFAULT_KEY_SOURCE]).toEqual(['api', 'env'])
 })
 
 test('PAUSE_REASONS: the credential, model, setup and environment failures', () => {
@@ -516,4 +513,87 @@ test('formatOnce: never throws, a throwing call is cli-failed and its message is
   expect(odd).toEqual({ ok: false, reason: 'cli-failed', costUsd: 0 })
   const cost = await formatOnce(done.source, { model: 'opus', effort: 'low', kind: 'short' }, stub({ ok: false, reason: 'cli-error', costUsd: Number.NaN }).call)
   expect(cost).toEqual({ ok: false, reason: 'cli-error', costUsd: 0 })
+})
+
+// -- the key file ---------------------------------------------------------------------------------------
+
+const GOOD = 'test-key-not-a-real-key-000000'
+const file = (key: string, extra = '') => `{\n  "orchUi": { "formatApiKey": ${JSON.stringify(key)}${extra} }\n}\n`
+const parsed = (text: string) => {
+  const r = parseKeyFile(text)
+  return r.ok ? 'ok' : r.reason
+}
+
+test('parseKeyFile: a valid file gives the key exactly as written', () => {
+  expect(parseKeyFile(file(GOOD))).toEqual({ ok: true, key: GOOD })
+  // other fields and a trailing blank are fine
+  expect(parseKeyFile(`{"model":"opus","orchUi":{"other":1,"formatApiKey":"${GOOD}"}}\n\n  `)).toEqual({ ok: true, key: GOOD })
+  // 20 and 256 characters are the edges
+  expect(parsed(file('k'.repeat(20)))).toBe('ok')
+  expect(parsed(file('k'.repeat(256)))).toBe('ok')
+  expect(parsed(file('k'.repeat(19)))).toBe('key-file-invalid')
+  expect(parsed(file('k'.repeat(257)))).toBe('key-file-invalid')
+})
+
+test('parseKeyFile: the value is never trimmed or repaired', () => {
+  expect(parsed(file(GOOD + ' '))).toBe('key-file-invalid')
+  expect(parsed(file(' ' + GOOD))).toBe('key-file-invalid')
+  expect(parsed(file(GOOD + '\n'))).toBe('key-file-invalid')
+  expect(parsed(file(GOOD.replace('not', 'n\u043ft')))).toBe('key-file-invalid')
+  expect(parsed(file(GOOD.replace('key', 'k\u00e9y')))).toBe('key-file-invalid')
+  // an escape in the file that reads as printable ASCII: the file says one thing and parses as another
+  expect(parsed(`{"orchUi":{"formatApiKey":"${GOOD.replace('test', '\\u0074est')}"}}`)).toBe('key-file-invalid')
+  expect(parsed(`{"orchUi":{"formatApiKey":"${GOOD.slice(0, 10)}\\/${GOOD.slice(10)}"}}`)).toBe('key-file-invalid')
+})
+
+test('parseKeyFile: not what the enforcer reads is refused', () => {
+  const cases: [string, string][] = [
+    ['the field twice', `{"orchUi":{"formatApiKey":"${GOOD}","formatApiKey":"${GOOD}2"}}`],
+    ['the field once more elsewhere', `{"orchUi":{"formatApiKey":"${GOOD}"},"other":{"formatApiKey":"${GOOD}2"}}`],
+    ['a BOM', '\uFEFF' + file(GOOD)],
+    ['a comment', `// my key\n${file(GOOD)}`],
+    ['a block comment', file(GOOD).replace('{', '{ /* c */')],
+    ['a trailing comma', file(GOOD, ',')],
+    ['not JSON', 'formatApiKey'],
+    ['empty', ''],
+    ['an array', `[{"orchUi":{"formatApiKey":"${GOOD}"}}]`],
+    ['the field at the top level', `{"formatApiKey":"${GOOD}"}`],
+    ['no orchUi object', `{"orchUi":"${GOOD}","formatApiKey":"x"}`],
+    ['only the old orchPane object', `{"orchPane":{"formatApiKey":"${GOOD}"}}`],
+    ['both objects, the new one without the field', `{"orchPane":{"formatApiKey":"${GOOD}"},"orchUi":{}}`],
+    ['a number', '{"orchUi":{"formatApiKey":12345678901234567890123}}'],
+    ['null', '{"orchUi":{"formatApiKey":null}}'],
+    ['an array value', `{"orchUi":{"formatApiKey":["${GOOD}"]}}`],
+    ['a non-ASCII lookalike', file(GOOD.replace('e', '\u0435'))],
+    ['a control character', file(GOOD.slice(0, 10) + '\u0001' + GOOD.slice(10))],
+  ]
+  for (const [name, text] of cases) expect([name, parsed(text)]).toEqual([name, 'key-file-invalid'])
+  expect(parseKeyFile(undefined as never)).toEqual({ ok: false, reason: 'key-file-invalid' })
+})
+
+test('parseKeyFile: a refusal does not carry the key', () => {
+  const r = parseKeyFile(file(GOOD + ' '))
+  expect(JSON.stringify(r).includes(GOOD)).toBe(false)
+})
+
+test('keyFileModeOk: only a regular file whose group and other bits are empty', () => {
+  const line = (mode: string) => `${mode}  1 501  20  200 Nov 10 10:00 /home/u/.claude/settings.local.json\n`
+  const cases: [string, number, boolean][] = [
+    ['-rw-------', 0, true],
+    ['-rw-------@', 0, true],
+    ['-rw-------.', 0, true],
+    ['-r--------', 0, true],
+    ['-rw-------+', 0, false],
+    ['-rw-r-----', 0, false],
+    ['-rw----r--', 0, false],
+    ['-rw-rw-rw-', 0, false],
+    ['-rwx--x---', 0, false],
+    ['lrwx------', 0, false],
+    ['drwx------', 0, false],
+    ['-rw-------', 1, false],
+  ]
+  for (const [mode, code, want] of cases) expect([mode, code, keyFileModeOk(line(mode), code)]).toEqual([mode, code, want])
+  expect(keyFileModeOk('', 0)).toBe(false)
+  expect(keyFileModeOk('ls: /x: No such file or directory\n', 0)).toBe(false)
+  expect(keyFileModeOk(undefined as never, 0)).toBe(false)
 })
