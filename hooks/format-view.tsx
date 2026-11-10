@@ -483,8 +483,10 @@ const SECTION = {
 // banner would clash. Validation reads the raw output, so only the drawing drops the marks.
 const plainTitle = (t: string) => t.replace(/`([^`\n]+)`/g, '$1')
 
-const PILL_LEFT = ''
-const PILL_RIGHT = ''
+// Nerd Font round caps (U+E0B6, U+E0B4), written as escapes: as literal private-use glyphs they were
+// dropped once and 0.1.0 shipped square pills.
+export const PILL_LEFT = '\ue0b6'
+export const PILL_RIGHT = '\ue0b4'
 const HEX = '(?=[0-9a-f]*\\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}'
 const IS_HEX = new RegExp(`^${HEX}$`)
 const TOKEN = new RegExp('(`[^`]+`|\\*\\*[^*]+\\*\\*|\\b' + HEX + '\\b)', 'g')
