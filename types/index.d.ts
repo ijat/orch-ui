@@ -13,9 +13,14 @@ export type Part =
   | { kind: 'section'; tag: SectionTag; title: string; body: string }
   | { kind: 'card'; title: string; rows: Row[] }
 export type FmtEntry =
-  | { state: 'pending' }
+  // `since`: when the conversion was claimed (ms since the epoch), for the placeholder's elapsed seconds
+  | { state: 'pending'; since?: number }
   | { state: 'done'; kind: RouteKind; parts: Part[] }
   | { state: 'kept'; kind: RouteKind; reason: string }
+// The main loop's turns: the number of the newest turn that started, and when it started while it runs (null once it ended).
+export type FmtTurn = { n: number; at: number | null }
+// The placeholder's animation: the frame number and the time (ms since the epoch) of the last tick.
+export type FmtFrame = { i: number; now: number }
 export type FmtOrderItem = { key: string; seq: number }
 export type FmtStats = {
   formatted: number
@@ -90,6 +95,13 @@ declare module 'claude-code' {
       fmtTrigger: Trigger
       fmtLatest: FmtLatest | null
       fmtLoaded: boolean
+      fmtTurn: FmtTurn
+      fmtFrame: FmtFrame
+      // conversions claimed and not yet ended; the animation timer runs while any is, or while a turn runs
+      fmtPendingN: number
+      fmtTicking: boolean
+      // counts the changes to the originals of hidden replies (module state), so a row that read it draws again
+      fmtHeld: number
     }
   }
 }

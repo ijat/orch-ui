@@ -1,6 +1,6 @@
 {
   "name": "orch-ui",
-  "version": "0.1.2",
+  "version": "0.3.0",
   "description": "Redraws an orchestrator session's long replies in a fixed layout: a banner with the point, what you must do, what blocks you, the rest, and the replies you can type",
   "types": "./types/index.d.ts"
 }

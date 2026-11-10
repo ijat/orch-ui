@@ -529,7 +529,9 @@ export function keyFileAclFree(stdout: string, exitCode: number): boolean {
 }
 
 // -- the marker ---------------------------------------------------------------------------------------
-// The orchestrator ends an important reply with this line (D33). The mod removes it wherever it draws.
+// The orchestrator starts an important reply with this line (D33, moved to the first line so the mod knows from
+// the first streamed characters); a marker on the last line, the old place, still counts. The mod removes it
+// wherever it draws.
 
 export const MARK = '<!-- orch-ui -->'
 
@@ -537,15 +539,34 @@ const lastContent = (lines: string[]): number => {
   for (let i = lines.length - 1; i >= 0; i--) if ((lines[i] ?? '').trim() !== '') return i
   return -1
 }
+const firstContent = (lines: string[]): number => lines.findIndex(l => l.trim() !== '')
 
-// A text with its marker line removed. Marked only when the last non-blank line, trimmed, is the marker; that line and
-// the blank lines before it go. A marker anywhere else stays in the text and does not count.
+// A text with its marker line removed. Marked when the first or the last non-blank line, trimmed, is the marker: that
+// line goes with the blank lines next to it (after the first-line marker, before the last-line one). A marker anywhere
+// else stays in the text and does not count.
 export function stripMark(text: string): { marked: boolean; text: string } {
-  const lines = String(text).split('\n')
+  let lines = String(text).split('\n')
+  let marked = false
+  const first = firstContent(lines)
+  if (first >= 0 && (lines[first] ?? '').trim() === MARK) {
+    marked = true
+    lines = lines.slice(first + 1)
+    const next = firstContent(lines)
+    lines = next < 0 ? [] : lines.slice(next)
+  }
   const at = lastContent(lines)
-  if (at < 0 || (lines[at] ?? '').trim() !== MARK) return { marked: false, text }
-  const keep = lastContent(lines.slice(0, at))
-  return { marked: true, text: lines.slice(0, keep + 1).join('\n') }
+  if (at >= 0 && (lines[at] ?? '').trim() === MARK) {
+    marked = true
+    lines = lines.slice(0, lastContent(lines.slice(0, at)) + 1)
+  }
+  return marked ? { marked, text: lines.join('\n') } : { marked: false, text }
+}
+
+// Whether the whole text so far is the start of a marker line: one line, a shorter prefix of the marker. Seen when a
+// reply that starts with the marker has streamed only its first characters.
+export function startsWithPartialMark(text: string): boolean {
+  const t = String(text).trimStart()
+  return t.length > 0 && t.length < MARK.length && MARK.startsWith(t)
 }
 
 // Whether the text ends in the start of a marker line: its last line (nothing after the final newline) is a
@@ -561,4 +582,42 @@ export function hidePartialMark(text: string): string {
   const lines = String(text).split('\n')
   lines.pop()
   return lines.slice(0, lastContent(lines) + 1).join('\n')
+}
+
+// Whether the first non-blank line, trimmed, is the marker: the only place the stream hook looks (flush 0 carries
+// whole lines, so a first line is never split).
+export function startsWithMark(text: string): boolean {
+  const lines = String(text).split('\n')
+  const first = firstContent(lines)
+  return first >= 0 && (lines[first] ?? '').trim() === MARK
+}
+
+// -- the tag ------------------------------------------------------------------------------------------
+// The stream hook hides a marked reply and puts one line in its place. The row that commits has that line as its text,
+// so the line carries an invisible tag: 8 hex characters as 32 zero-width characters between two word joiners, which
+// the render hook decodes to find the original. The set is fixed here; nothing else in orch-ui writes these characters.
+
+export const TAG_ZERO = '\u200b'
+export const TAG_ONE = '\u200c'
+export const TAG_EDGE = '\u2060'
+const TAG_RE = new RegExp(`${TAG_EDGE}[${TAG_ZERO}${TAG_ONE}]{32}${TAG_EDGE}`, 'g')
+
+// The tag of an id of 8 hex characters.
+export function tagOf(id: string): string {
+  if (!/^[0-9a-f]{8}$/.test(id)) throw new Error('a tag id is 8 lowercase hex characters')
+  const bits = [...id].map(c => parseInt(c, 16).toString(2).padStart(4, '0')).join('')
+  return TAG_EDGE + [...bits].map(b => (b === '1' ? TAG_ONE : TAG_ZERO)).join('') + TAG_EDGE
+}
+
+// The id of the first tag in the text, or null.
+export function untag(text: string): string | null {
+  const m = new RegExp(TAG_RE.source).exec(String(text))
+  if (!m) return null
+  const bits = [...m[0].slice(1, -1)].map(c => (c === TAG_ONE ? '1' : '0')).join('')
+  return (bits.match(/.{4}/g) ?? []).map(b => parseInt(b, 2).toString(16)).join('')
+}
+
+// The text without any tag.
+export function stripTag(text: string): string {
+  return String(text).replace(TAG_RE, '')
 }
