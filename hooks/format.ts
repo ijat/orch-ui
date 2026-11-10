@@ -504,11 +504,25 @@ export function parseKeyFile(text: string): KeyParse {
 }
 
 // Whether `ls -ln` says the file is a regular file only its owner can touch: no group or other bit, no ACL
-// marker (`+`). `@` (extended attributes) and `.` (a security label) do not widen access. A failed command is unsafe.
+// marker (`+`). `@` (extended attributes) and `.` (a security label) do not widen access by themselves, but `@` can hide
+// an ACL (see keyFileNeedsAclCheck). A failed command is unsafe.
 export function keyFileModeOk(stdout: string, exitCode: number): boolean {
   if (exitCode !== 0 || typeof stdout !== 'string') return false
   const m = /^-[r-][w-][x-]-{6}([@.+]?)\s/.exec(stdout)
   return m !== null && m[1] !== '+'
+}
+
+// macOS `ls` prints `@` (extended attributes) in place of `+`, so an ACL can hide behind it. True when the mode
+// field of `ls -ln` ends in `@`: only then is the second look (`ls -led`) needed. GNU `ls` never prints `@`.
+export function keyFileNeedsAclCheck(stdout: string): boolean {
+  return typeof stdout === 'string' && /^-[r-][w-][x-]-{6}@\s/.test(stdout)
+}
+
+// Whether `ls -led` shows no ACL entry: exactly one non-blank line, the file's own. Entries print on the lines
+// after it (` 0: group:everyone allow read`). A failed command, or anything doubtful, is unsafe.
+export function keyFileAclFree(stdout: string, exitCode: number): boolean {
+  if (exitCode !== 0 || typeof stdout !== 'string') return false
+  return stdout.split('\n').filter(l => l.trim() !== '').length === 1
 }
 
 // -- the marker ---------------------------------------------------------------------------------------

@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import {
   DEFAULT_BILLING, DEFAULT_EFFORT, DEFAULT_KEY_SOURCE, DEFAULT_MODEL, EFFORTS, FORMAT_SYSTEM, KINDS, LIMITS, MODELS, PAUSE_REASONS,
-  MARK, cliArgs, cliEnv, contrast, eligible, endsWithPartialMark, formatOnce, hidePartialMark, identifiers, keyFileModeOk, kindOf, limits, parseKeyFile, route,
+  MARK, cliArgs, cliEnv, contrast, eligible, endsWithPartialMark, formatOnce, hidePartialMark, identifiers, keyFileAclFree, keyFileModeOk, keyFileNeedsAclCheck, kindOf, limits, parseKeyFile, route,
   stripMark, validate, verifyRun,
 } from '../hooks/format'
 import type { CallOutcome, CallRequest } from '../hooks/format'
@@ -597,6 +597,22 @@ test('keyFileModeOk: only a regular file whose group and other bits are empty', 
   expect(keyFileModeOk('', 0)).toBe(false)
   expect(keyFileModeOk('ls: /x: No such file or directory\n', 0)).toBe(false)
   expect(keyFileModeOk(undefined as never, 0)).toBe(false)
+})
+
+test('keyFileNeedsAclCheck and keyFileAclFree: an ACL hidden behind `@` is found by the second look', () => {
+  const line = (mode: string) => `${mode}  1 501  20  200 Nov 10 10:00 /home/u/.claude/settings.local.json\n`
+  // only the `@` mode asks for the second look
+  for (const [mode, want] of [['-rw-------@', true], ['-rw-------', false], ['-rw-------.', false], ['-rw-------+', false], ['-rw-r-----@', false]] as const) {
+    expect([mode, keyFileNeedsAclCheck(line(mode))]).toEqual([mode, want])
+  }
+  expect(keyFileNeedsAclCheck(undefined as never)).toBe(false)
+  // `ls -led` on macOS: the file's line, then one line per ACL entry
+  expect(keyFileAclFree(line('-rw-------@'), 0)).toBe(true)
+  expect(keyFileAclFree(line('-rw-------@') + ' 0: group:everyone allow read\n', 0)).toBe(false)
+  expect(keyFileAclFree(line('-rw-------@') + ' 0: user:other allow read\n 1: group:staff deny write\n', 0)).toBe(false)
+  expect(keyFileAclFree(line('-rw-------@'), 1)).toBe(false)
+  expect(keyFileAclFree('', 0)).toBe(false)
+  expect(keyFileAclFree(undefined as never, 0)).toBe(false)
 })
 
 // -- the marker -----------------------------------------------------------------------------------------
