@@ -24,7 +24,15 @@ export type FmtStats = {
   spentUsd: number
   billing: Billing | null
   viaBaseUrl: boolean
+  // eligible replies seen, how many carried the marker, and on-request conversions (the ones the user had to ask for)
+  eligible: number
+  marked: number
+  asked: number
 }
+// Which replies are converted: only the ones the orchestrator marked, or every eligible one.
+export type Trigger = 'marked' | 'auto'
+// The newest eligible reply of the session by turn.complete order; `retried` once a request converted it a second time.
+export type FmtLatest = { key: string; text: string; seq: number; retried: boolean }
 
 // One formatter call through a `claude -p` child (hooks/format.ts builds the argv and env and checks the stream).
 // `api` is `--bare` with ANTHROPIC_API_KEY; `subscription` is the claude.ai login with the key blanked.
@@ -75,6 +83,8 @@ declare module 'claude-code' {
       fmtBilling: Billing
       fmtKey: KeySource
       fmtPause: string | null
+      fmtTrigger: Trigger
+      fmtLatest: FmtLatest | null
     }
   }
 }
