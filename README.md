@@ -116,9 +116,9 @@ The first group pauses formatting for the session. The reply stays as written, n
 
 | Reason | What it means and what to do |
 | --- | --- |
-| `billing-mismatch` | The run did not use the credential the **Format billing** row asks for. With `API key` billing this is also what a missing key looks like: no `ANTHROPIC_API_KEY` reached the run (or the key file gave none). Set the variable before starting `claude`, or switch **Format billing** to `subscription`, then press a row. With `subscription`, check your claude.ai login. |
+| `billing-mismatch` | The run did not use the credential the **Format billing** row asks for. With `API key` billing this is also what a missing key looks like: no `ANTHROPIC_API_KEY` reached the run. Set the variable before starting `claude`, or switch **Format billing** to `subscription`, then press a row. With `subscription`, the run reported an API key where the claude.ai login was asked for (the plugin blanks `ANTHROPIC_API_KEY` for these runs, so the key came from elsewhere). Press a row; if it repeats, switch **Format billing** to `API key` or turn formatting off. |
 | `model-mismatch` | The run answered with another model than the **Format model** row. Press a row; pick another model if it repeats. |
-| `no-credential` | An API run that did use a key ended with an error, with no output and no cost, and no API status. Check the key, then press a row. |
+| `no-credential` | No credential worked and nothing was spent. With `subscription`, the child is not logged in to claude.ai: log in, then press a row. With `API key`, the key was sent but the run ended with no output, cost or status: check the key, then press a row. |
 | `auth-failed` | The API refused the key (401 or 403). Replace the key. |
 | `cli-missing` | The `claude` command was not found. Put it on `PATH`. |
 | `cloud-provider` | A Bedrock, Vertex, Foundry or similar provider variable is set. Formatting uses Anthropic's own API only; unset it for this plugin to work. |
