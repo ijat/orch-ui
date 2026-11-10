@@ -85,6 +85,7 @@ declare module 'claude-code' {
       fmtPause: string | null
       fmtTrigger: Trigger
       fmtLatest: FmtLatest | null
+      fmtLoaded: boolean
     }
   }
 }
