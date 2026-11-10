@@ -23,17 +23,23 @@ const INFO_OUTPUT = '# [info] `src/a.ts` is unchanged\n\n## [more] Where it stan
 // The compaction tool is there from session start; the formatter's is the one that comes with the marking.
 const formatTools = (w: { tools: string[] }) => w.tools.filter(t => t === FORMAT_TOOL)
 
-type World = { calls: Call[]; tools: string[]; store: Map<string, unknown>; replies: Map<string, Reply>; delays: Map<string, number> }
+type World = { calls: Call[]; tools: string[]; commands: string[]; opened: Record<string, unknown>[]; store: Map<string, unknown>; replies: Map<string, Reply>; delays: Map<string, number> }
 
 // The engine beneath the plugin: just enough for session.start, the model, the store and the tool registry.
 async function boot($: Engine, on: On, seed: Record<string, unknown> = { 'opt:format': true }) {
   const clock = mock.clock(on, { now: Date.parse('2026-11-10T10:00Z') })
-  const w: World = { calls: [], tools: [], store: new Map(Object.entries(seed)), replies: new Map(), delays: new Map() }
+  const w: World = { calls: [], tools: [], commands: [], opened: [], store: new Map(Object.entries(seed)), replies: new Map(), delays: new Map() }
   mock.env(on, { HOME: '/home/u' })
   on('session.cwd', () => ({ value: '/proj' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('command.register', () => ({ value: { command: 'orch-pane' } }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('command.register', (_, e) => {
+    w.commands.push(e.name)
+    return { value: { command: e.name } }
+  })
+  on('ui.open', (_, e) => {
+    w.opened.push({ ...e })
+    return { value: { isPlaced: true } }
+  })
   on('ui.panes', () => ({ value: [] }))
   on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: 'no orch', isStdoutTruncated: false, isStderrTruncated: false } }))
   on('turn.complete', () => ({ text: '' }))
@@ -41,7 +47,7 @@ async function boot($: Engine, on: On, seed: Record<string, unknown> = { 'opt:fo
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('tool.register', (_, e) => {
     w.tools.push(e.name)
-    return { value: { tool: `mcp__orch-pane__${e.name}` } }
+    return { value: { tool: `mcp__orch-ui__${e.name}` } }
   })
   on('store.get', (_, e) => ({ value: w.store.get(e.key) }))
   on('store.set', (_, e) => {
@@ -81,22 +87,20 @@ async function finish($: Engine, b: Booted, answer: string, extra: Record<string
   await b.clock.settle()
 }
 const show = ($: Engine, text: string, extra: Record<string, unknown> = {}) =>
-  $.ui.mount({ plugin: 'orch-pane', surface: 'terminal', component: 'AssistantMessage', requestId: `m${text.length}-${Math.random()}`, props: { text, isFirstOfReply: true, ...extra } as never })
+  $.ui.mount({ plugin: 'orch-ui', surface: 'terminal', component: 'AssistantMessage', requestId: `m${text.length}-${Math.random()}`, props: { text, isFirstOfReply: true, ...extra } as never })
 type Ui = Awaited<ReturnType<typeof show>>
 // The engine draws the message itself while no hook rewrites it.
 const isOriginal = async (ui: Ui) => (await ui.drawn()).type === 'engine'
 const texts = async (ui: Ui) => (await ui.findAll({ type: 'Text' })).map(t => t.text)
 
 const PANE = {
-  plugin: 'orch-pane', component: 'Pane', requestId: 'orch-pane', surface: 'terminal',
-  props: { title: 'Orchestration', isFocused: false, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} },
+  plugin: 'orch-ui', component: 'Pane', requestId: 'orch-ui', surface: 'terminal',
+  props: { title: 'orch-ui', isFocused: false, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} },
 } as const
-async function optionsPane($: Engine) {
-  const ui = await $.ui.mount(PANE as never)
-  await ui.press({ key: 'tab:more' })
-  return ui
+async function settingsPane($: Engine) {
+  return $.ui.mount(PANE as never)
 }
-const optionRow = async (ui: Awaited<ReturnType<typeof optionsPane>>) => {
+const optionRow = async (ui: Awaited<ReturnType<typeof settingsPane>>) => {
   const row = await ui.find({ type: 'Button', key: 'opt-format' })
   const note = (await ui.findAll({ type: 'Text' })).find(t => /raw:|formatted \d|last:/.test(t.text))
   return { label: row?.text, note: note?.text }
@@ -130,7 +134,7 @@ test('a long reply takes the long route and the row note names it', async ($, on
   await finish($, b, long.source)
   expect(b.w.calls).toHaveLength(1)
   expect(b.w.calls[0]).toMatchObject({ ...LONG_ROUTE, prompt: long.source })
-  const ui = await optionsPane($)
+  const ui = await settingsPane($)
   expect((await optionRow(ui)).note).toBe(`formatted 1 · as written 0 · last: ok (long/${LONG_MODEL})`)
   await ui.unmount()
 })
@@ -195,7 +199,7 @@ const FAILS: [string, Reply, string][] = [
   ['an API error', { reason: 'api-error' }, 'no-answer'],
   ['an empty reply', { reason: 'empty-reply' }, 'no-answer'],
   ['a timeout', { reason: 'aborted' }, 'timeout'],
-  ['a model the engine refuses', { deny: 'model not allowed' }, 'refused: orch-pane: $.model.complete: model not allowed'],
+  ['a model the engine refuses', { deny: 'model not allowed' }, 'refused: orch-ui: $.model.complete: model not allowed'],
   ['a reply that used its whole cap', { text: options.output, tokens: SHORT_MAX_TOKENS }, 'truncated'],
   ['a rewrite that fails validation', 'Not in the format at all.', 'no-banner'],
   ['a rewrite that drops an id', options.output.replace(/`v3\.0\.0`/g, 'the release'), 'missing-id'],
@@ -209,7 +213,7 @@ for (const [name, reply, reason] of FAILS) {
     expect(b.w.calls).toHaveLength(1)
     const ui = await show($, options.source)
     expect(await isOriginal(ui)).toBe(true)
-    const pane = await optionsPane($)
+    const pane = await settingsPane($)
     expect((await optionRow(pane)).note).toBe(`formatted 0 · as written 1 · last: ${reason} (short/${SHORT_MODEL})`)
     // The same text is not asked twice.
     await finish($, b, options.source)
@@ -236,17 +240,37 @@ test('summary rows and other surfaces are left as they are', async ($, on) => {
   await finish($, b, options.source)
   const summary = await show($, options.source, { isSummary: true })
   expect(await isOriginal(summary)).toBe(true)
-  const desktop = await $.ui.mount({ plugin: 'orch-pane', surface: 'desktop', component: 'AssistantMessage', requestId: 'd1', props: { text: options.source, isFirstOfReply: true } })
+  const desktop = await $.ui.mount({ plugin: 'orch-ui', surface: 'desktop', component: 'AssistantMessage', requestId: 'd1', props: { text: options.source, isFirstOfReply: true } })
   expect(await desktop.drawn()).toMatchObject({ type: 'engine' })
   await summary.unmount()
   await desktop.unmount()
 })
 
-// -- the options row ------------------------------------------------------------------------------------
+// -- the settings pane ----------------------------------------------------------------------------------
+
+test('session start registers /orch-ui once and /orch-ui opens the pane', async ($, on) => {
+  const b = await boot($, on)
+  expect(b.w.commands).toEqual(['orch-ui'])
+  const out = await $.command.run({ command: 'orch-ui', args: '' } as never)
+  await b.clock.settle()
+  expect(out.text).toBe('orch-ui settings opened.')
+  expect(b.w.opened).toHaveLength(1)
+  expect(b.w.opened[0]).toMatchObject({ id: 'orch-ui', title: 'orch-ui', closeOnEscape: true })
+})
+
+test('the pane holds the Format replies row and nothing else', async ($, on) => {
+  await boot($, on)
+  const ui = await settingsPane($)
+  expect((await ui.findAll({ type: 'Button' })).map(x => x.key)).toEqual(['opt-format'])
+  expect((await optionRow(ui)).label).toBe('[x] Format replies')
+  await ui.unmount()
+})
+
+// -- the settings row ------------------------------------------------------------------------------------
 
 test('Format replies: off by default, a press flips it and the store keeps it, the store is read at session start', async ($, on) => {
   const b = await boot($, on, {})
-  const ui = await optionsPane($)
+  const ui = await settingsPane($)
   expect((await optionRow(ui)).label).toBe('[ ] Format replies')
   expect((await optionRow(ui)).note).toBeUndefined()
   await ui.press({ key: 'opt-format' })
@@ -260,7 +284,7 @@ test('Format replies: off by default, a press flips it and the store keeps it, t
 
 test('Format replies reads the stored option at session start', async ($, on) => {
   await boot($, on, { 'opt:format': true })
-  const ui = await optionsPane($)
+  const ui = await settingsPane($)
   expect((await optionRow(ui)).label).toBe('[x] Format replies')
   await ui.unmount()
 })
@@ -286,7 +310,7 @@ test('the raw tool is registered when the session is marked, and not before', as
   expect(formatTools(b.w)).toEqual([FORMAT_TOOL])
   await orchestrate($)
   expect(formatTools(b.w)).toEqual([FORMAT_TOOL])
-  expect(FORMAT_TOOL_FULL).toBe('mcp__orch-pane__set_message_format')
+  expect(FORMAT_TOOL_FULL).toBe('mcp__orch-ui__set_message_format')
 })
 
 test('raw with the default scope shows only the newest formatted message as written, and the next reply is formatted again', async ($, on) => {
@@ -316,7 +340,7 @@ test('raw for the session shows every row as written and starts no conversion; f
   const { first, second } = await twoFormatted($, b)
   const r = await callTool($, { format: 'raw', scope: 'session' })
   expect(resultOf(r)).toContain('Scope session')
-  expect(resultOf(r)).toContain('stored option in orch-pane is untouched')
+  expect(resultOf(r)).toContain('stored option in orch-ui is untouched')
   expect(await isOriginal(first)).toBe(true)
   expect(await isOriginal(second)).toBe(true)
   b.w.replies.set(review.source, review.output)
@@ -360,17 +384,17 @@ test('with the option off the tool says so and changes nothing', async ($, on) =
   await boot($, on, {})
   await orchestrate($)
   for (const input of [{ format: 'raw' }, { format: 'raw', scope: 'session' }, { format: 'formatted' }]) {
-    expect(resultOf(await callTool($, input))).toBe("Formatting is off in orch-pane's options (Format replies); nothing changed.")
+    expect(resultOf(await callTool($, input))).toBe("Formatting is off in orch-ui's settings (/orch-ui); nothing changed.")
   }
-  const ui = await optionsPane($)
+  const ui = await settingsPane($)
   expect((await optionRow(ui)).note).toBeUndefined()
   await ui.unmount()
 })
 
-test('the options row shows the raw state, and a press clears it and keeps the option on', async ($, on) => {
+test('the settings row shows the raw state, and a press clears it and keeps the option on', async ($, on) => {
   const b = await boot($, on)
   const { first, second } = await twoFormatted($, b)
-  const ui = await optionsPane($)
+  const ui = await settingsPane($)
   expect((await optionRow(ui)).note).toMatch(/^formatted 2 · as written 0 · last: ok/)
   await callTool($, { format: 'raw' })
   expect((await optionRow(ui)).note).toMatch(/^raw: 1 message\(s\) · formatted 2/)

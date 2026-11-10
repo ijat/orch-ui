@@ -1,0 +1,5 @@
+{
+  "name": "orch-ui",
+  "owner": { "name": "ijat" },
+  "plugins": [{ "name": "orch-ui", "source": "./" }]
+}
