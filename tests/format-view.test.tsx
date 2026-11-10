@@ -980,6 +980,30 @@ test('settings: model, effort and billing come from the store, and the limits fo
   expect(await noteOf($)).toBe('formatted 2 · as written 0 · last: ok (long/sonnet) · plan $0.01')
 })
 
+// Spend is kept per billing: a switch inside a session never relabels money already spent.
+const SWITCH_CASES: [string, string, string, string][] = [
+  ['api then subscription', 'api', 'subscription', 'api $0.02 · plan $0.04'],
+  ['subscription then api', 'subscription', 'api', 'api $0.04 · plan $0.02'],
+]
+for (const [name, first, second, spend] of SWITCH_CASES) {
+  test(`settings: switching billing in a session labels each amount with its own billing (${name})`, async ($, on) => {
+    const b = await boot($, on, { 'opt:format': true, 'opt:format-billing': first })
+    b.w.replies.set(options.source, options.output)
+    b.w.replies.set(done.source, done.output)
+    await orchestrate($)
+    b.w.cost = 0.02
+    await finish($, b, options.source)
+    expect(await noteOf($)).toMatch(new RegExp(`${first === 'api' ? 'api' : 'plan'} \\$0\\.02$`))
+    const ui = await settingsPane($)
+    await ui.press({ key: 'opt-format-billing' })
+    await ui.unmount()
+    b.w.cost = 0.04
+    await finish($, b, done.source)
+    expect(b.w.calls.map(c => c.argv.includes('--bare'))).toEqual([first === 'api', second === 'api'])
+    expect(await noteOf($)).toBe(`formatted 2 · as written 0 · last: ok (short/opus) · ${spend}`)
+  })
+}
+
 test('settings: a stored value of another kind reads as the default (opus, low, api, env)', async ($, on) => {
   const b = await boot($, on, { 'opt:format': true, 'opt:format-model': 'fable', 'opt:format-effort': 'max', 'opt:format-billing': 'oauth', 'opt:format-key': 7 })
   await convertOne($, b)

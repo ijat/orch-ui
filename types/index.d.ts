@@ -21,7 +21,10 @@ export type FmtStats = {
   formatted: number
   kept: number
   last: { reason: string; kind: RouteKind; model: string } | null
-  spentUsd: number
+  // money by the billing that paid: api runs and subscription (plan) runs are kept apart
+  spentApiUsd: number
+  spentPlanUsd: number
+  // the last run's billing; labels a $0.00 note while nothing has been spent
   billing: Billing | null
   viaBaseUrl: boolean
   // eligible replies seen, how many carried the marker, and on-request conversions (the ones the user had to ask for)
