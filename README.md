@@ -47,7 +47,7 @@ A setting applies from the next call. Pressing any of the five setting rows also
 
 In a session where the `orchestrate` skill has loaded, orch-ui redraws the agent's finished replies in a fixed layout: a colored banner with the point of the message, a titled section for what you must do, at most one bordered panel for what blocks you, sections for the rest, and the replies you can type last. Identifiers (paths, branches, commits, versions, issues, ids, URLs, commands) are drawn as small colored pills. It is a redraw only: the stored transcript never changes, and any other session is left alone, with no model call and no tool (a page saved earlier is still redrawn, see **Resume**). Terminal only.
 
-A reply that is not marked (see below) is shown as written until its rewrite arrives, then swapped. A marked reply is never shown as plain text first: from its first streamed characters until the rewrite is ready it is drawn as a rounded page with one animated line (`⠹ formatting reply · 3s`, the spinner and the seconds since the work began). If the rewrite fails, or formatting is paused, the page gives way to the original text (the marker removed) with one dim line under it, `orch-ui: shown as written (<reason>)`; a reply shown raw, or with the option off, is the original text with no line. A marked reply from an earlier turn that never got a rewrite (an old transcript) is drawn as written, not as the placeholder. Only the main agent's replies are rewritten, and only when they have no code fence, no table and no banner already.
+A reply that is not marked (see below) is shown as written until its rewrite arrives, then swapped. A marked reply is never shown as plain text first. While it streams, none of its text is drawn: one line, `⠋ formatting reply`, with a dot added for each of the first few batches of lines. When the reply is complete that line gives way to a rounded page with one animated line (`⠹ formatting reply · 3s`, the spinner and the seconds since the work began) until the rewrite is ready. If the rewrite fails, or formatting is paused, the page gives way to the original text (the marker removed) with one dim line under it, `orch-ui: shown as written (<reason>)`; a reply shown raw, or with the option off, is the original text with no line. A marked reply from an earlier turn that never got a rewrite (an old transcript) is drawn as written, not as the placeholder. Only the main agent's replies are rewritten, and only when they have no code fence, no table and no banner already.
 
 | Reply length | Output cap, time limit at `low` | at `medium` | at `high` |
 | --- | --- | --- | --- |
@@ -59,6 +59,17 @@ Anything shorter, longer or excluded stays as written. The model and effort are 
 ### Resume: finished pages come back
 
 A page that was formatted successfully is saved in orch-ui's own store (`fmt:<key>` per reply, plus an index), so a resumed session draws it again at once, with no model call. This works whether or not the `orchestrate` skill has loaded yet; converting a new reply still needs the skill. Only finished pages are saved (a failure is not), at most 200 pages and 1 MiB of JSON in all, oldest dropped first. A saved value of another shape or version is ignored and cleaned up at the next save. `/clear` does not delete saved pages, and with **Format replies** off nothing is drawn from them. The saved text is the model's rewrite of your reply, kept locally in the plugin's store file under your Claude Code configuration directory.
+
+### How a marked reply is hidden while it streams
+
+The terminal draws a streaming reply without asking orch-ui, so the plain text would show until the reply is done. orch-ui therefore hooks Claude Code's `MessageDisplay` event, which fires with each batch of finished lines and decides what is drawn. In an orchestrator session with **Format replies** on (and not raw, not paused), a reply whose first line is the marker is answered with the one placeholder line and nothing else; orch-ui keeps the model's text in memory. Every other reply, every other session and a subagent's reply pass through byte for byte, and so does a batch where orch-ui hits an error, so a failure never hides text. The display only changes: the stored transcript and what the model sees are the model's own text.
+
+The row that Claude Code commits holds the placeholder line, not the reply, and that line ends in an invisible tag (32 zero-width characters between two word joiners, U+200B, U+200C and U+2060, naming the message). The render hook reads the tag to find the kept text and draws the spinner and then the page from it; it never draws or stores the tag. Things to know:
+
+- The kept text lives for the session: `/clear` drops it, and a plugin reload loses it, after which the row stays the placeholder line (the page for that reply is still in the store and comes back on the next resume).
+- A turn that is interrupted or fails shows the lines that arrived, as written.
+- A marked reply that is too short or too long for the model to rewrite is hidden while it streams and then drawn as written.
+- The committed row's own text is the placeholder line with the tag, so anything that reads the row itself (a copy, an export) sees that, not the reply; the transcript keeps the reply.
 
 ### Which replies: the marker and "format that"
 

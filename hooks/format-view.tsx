@@ -8,7 +8,7 @@ import { formatCall } from './format-call'
 import type { CallSeen } from './format-call'
 import {
   DEFAULT_BILLING, DEFAULT_EFFORT, DEFAULT_KEY_SOURCE, DEFAULT_MODEL, EFFORTS, KINDS, MODELS, PAUSE_REASONS, endsWithPartialMark, formatOnce, hidePartialMark,
-  kindOf, route, startsWithPartialMark, stripMark,
+  kindOf, route, startsWithMark, startsWithPartialMark, stripMark, stripTag, tagOf, untag,
 } from './format'
 import type { Kind, Part, Route, Row, RowTag } from './format'
 import { textKey } from './lib'
@@ -69,6 +69,8 @@ const fmtFrame = atom({ plugin: 'orch-ui', key: 'fmtFrame' } as const, START_FRA
 // Conversions claimed and not yet ended, and whether the timer runs (the handle is `ticker`, below).
 const fmtPendingN = atom({ plugin: 'orch-ui', key: 'fmtPendingN' } as const, 0)
 const fmtTicking = atom({ plugin: 'orch-ui', key: 'fmtTicking' } as const, false)
+// Counts the changes to `held` (below), so a row that read it is drawn again when a hidden reply is complete.
+const fmtHeld = atom({ plugin: 'orch-ui', key: 'fmtHeld' } as const, 0)
 
 // One entry and one raw mark per message, by the key of its text.
 // The reference is written out in each call: the scan that lists what a module reads and writes needs literal
@@ -406,6 +408,10 @@ async function resetSession($: EngineInterface) {
   await update($, fmtPendingN, () => 0)
   await update($, fmtTurn, () => NO_TURN)
   await update($, fmtFrame, () => START_FRAME)
+  // Hidden replies and their originals belong to the session that is gone.
+  streams.clear()
+  held.clear()
+  await bumpHeld($)
 }
 
 // "Format that": converts the session's latest eligible reply when it was left as written. Only that reply; an older
@@ -823,6 +829,138 @@ export function drawParts(el: ElementTable<'terminal'>, parts: readonly Part[]) 
   )
 }
 
+// -- hiding a marked reply while it streams (D9-D11) ------------------------------------------------------------
+// The terminal draws a streaming reply without calling the render hook, so the plain text would show until the reply
+// is done. `classic.MessageDisplay` fires per batch of finished lines (flush) and what it returns is what is drawn, and
+// what the committed row holds: the concatenation of the returned `displayContent`. A marked reply in an orchestrator
+// session with the option on is therefore answered with one placeholder line plus an invisible tag (flush 0) and
+// nothing else; the original is kept here, under the tag, and the render hook finds it again. Every other flush
+// passes through untouched, and so does a flush after any error. The animated spinner starts when the row commits.
+
+const PLACEHOLDER = `${FRAMES[0]} formatting reply`
+// Progress dots after the placeholder: one per flush, the first few only, so the line never wraps.
+const DOTS = 5
+// How long a later flush waits for flush 0 to decide before it passes through.
+const DECIDE_WAIT_MS = 2000
+const STREAMS_MAX = 4000
+const HELD_MAX = 200
+
+type Stream = {
+  tag: string
+  // the deltas by flush index; emptied once the reply is known to be unmarked
+  deltas: string[]
+  // undefined until flush 0 has decided
+  verdict: boolean | undefined
+  decided: Promise<boolean>
+  settle: (v: boolean) => void
+}
+// Open messages by message id. Module state: the hook of one flush must see what the others did, and a flush does not wait for the one before.
+const streams = new Map<string, Stream>()
+// A marked reply's original under its tag: null text while it streams (or when it cannot be known), the whole text once the final flush ran.
+type Held = { text: string | null; final: boolean }
+const held = new Map<string, Held>()
+
+// The tag id of a message: 8 hex characters of the hash of its message id.
+const tagIdOf = (messageId: string) => textKey(messageId).slice(3, 11)
+
+function streamOf(messageId: string): Stream {
+  let m = streams.get(messageId)
+  if (!m) {
+    let settle!: (v: boolean) => void
+    const decided = new Promise<boolean>(resolve => {
+      settle = resolve
+    })
+    m = { tag: tagIdOf(messageId), deltas: [], verdict: undefined, decided, settle }
+    streams.set(messageId, m)
+    if (streams.size > STREAMS_MAX) streams.delete(streams.keys().next().value as string)
+  }
+  return m
+}
+
+function holdText(tag: string, h: Held) {
+  held.delete(tag)
+  held.set(tag, h)
+  if (held.size > HELD_MAX) held.delete(held.keys().next().value as string)
+}
+
+const bumpHeld = ($: EngineInterface) => update($, fmtHeld, n => (n ?? 0) + 1).catch(() => undefined)
+
+// Whether flush 0 hides the reply: it starts with the marker (checked first, so an unmarked reply costs no state read),
+// and the session is an orchestrator one with the option on, not raw, not paused.
+async function hidesReply($: EngineInterface, delta: string): Promise<boolean> {
+  if (!startsWithMark(delta)) return false
+  if ((await read($, fmtOrch)) !== true || (await read($, fmtOn)) !== true) return false
+  return (await read($, fmtRaw)) !== true && (await read($, fmtPause)) == null
+}
+
+// The verdict of flush 0 for a later flush: at once when it is known, else after it, and `false` if it does not come.
+async function verdictOf($: EngineInterface, m: Stream): Promise<boolean> {
+  if (m.verdict !== undefined) return m.verdict
+  let timer: Timer | undefined
+  const timeout = new Promise<boolean>(resolve => {
+    timer = $.clock.after(DECIDE_WAIT_MS, () => resolve(false))
+  })
+  try {
+    return await Promise.race([m.decided, timeout])
+  } finally {
+    try {
+      timer?.cancel()
+    } catch {
+      // Nothing runs under it any more.
+    }
+  }
+}
+
+const deltaText = (m: Stream) => m.deltas.join('')
+const isComplete = (m: Stream, last: number) => m.deltas.length === last + 1 && m.deltas.every(d => d !== undefined)
+
+type Flush = { message_id: string; index: number; final: boolean; delta: string; agent_id?: string }
+
+// The `displayContent` of one flush, or undefined to leave it as it is. The part before the first await runs when the
+// hook is called: it files the message and its delta before any later flush can look.
+async function displayOf($: EngineInterface, e: Flush): Promise<string | undefined> {
+  // Only the main agent's replies are marked, and only those are redrawn.
+  if (e.agent_id !== undefined) return undefined
+  const m = streamOf(e.message_id)
+  if (m.verdict !== false) m.deltas[e.index] = e.delta
+  if (e.index === 0) {
+    let verdict = false
+    try {
+      verdict = await hidesReply($, e.delta)
+    } finally {
+      m.verdict = verdict
+      if (verdict) holdText(m.tag, { text: null, final: false })
+      else m.deltas = []
+      m.settle(verdict)
+    }
+  }
+  const hidden = m.verdict ?? (await verdictOf($, m))
+  if (!hidden) {
+    if (e.final) streams.delete(e.message_id)
+    return undefined
+  }
+  if (e.final) {
+    holdText(m.tag, { text: isComplete(m, e.index) ? deltaText(m) : null, final: true })
+    streams.delete(e.message_id)
+    await bumpHeld($)
+  }
+  if (e.index === 0) return PLACEHOLDER + tagOf(m.tag)
+  return !e.final && e.index <= DOTS ? ' .' : ''
+}
+
+// A turn that ended without its last flush (interrupted, refused, failed): what was received is the original, so the
+// committed row shows it as written instead of waiting for a flush that is not coming.
+async function closeStreams($: EngineInterface) {
+  let any = false
+  for (const [id, m] of streams) {
+    if (m.verdict !== true) continue
+    holdText(m.tag, { text: deltaText(m), final: true })
+    streams.delete(id)
+    any = true
+  }
+  if (any) await bumpHeld($)
+}
+
 // -- hooks -------------------------------------------------------------------------------------------
 
 // The number of the turn each message first drew in (0: drawn while no turn ran), by its id. A row that streams in is
@@ -865,8 +1003,23 @@ export function registerFormat(on: On) {
   // A turn that ends without an answer (interrupted, refused, failed) only ends the turn.
   on('turn.complete', { reason: ['aborted', 'refusal', 'error'] }, async ($, e, next) => {
     const done = await next(e)
-    if (e.agentId === undefined) await endTurn($).catch(() => undefined)
+    if (e.agentId === undefined) {
+      await closeStreams($).catch(() => undefined)
+      await endTurn($).catch(() => undefined)
+    }
     return done
+  })
+
+  // The stream of a marked reply is hidden here (see above). Any error leaves the flush as it is.
+  on('classic.MessageDisplay', async ($, e, next) => {
+    let out: string | undefined
+    try {
+      out = await displayOf($, e)
+    } catch {
+      out = undefined
+    }
+    const base = await next(e)
+    return out === undefined ? base : { ...base, displayContent: out }
   })
 
   // A /clear ends the conversation without a new session.start: forget this session's state, keep the option.
@@ -908,17 +1061,30 @@ export function registerFormat(on: On) {
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
     // The marker line is never shown, in any session and on any surface; a half-written one is hidden while the reply
     // streams in an orchestrator session. A row without either is passed on untouched.
-    const original = e.props.text
+    const rowText = e.props.text
+    // A row the stream hook hid carries a tag. Its original is held under it: complete once the final flush ran, else
+    // the reply is still streaming. A tag whose original is gone (a reload) is drawn as its own line, tag removed.
+    const tag = untag(rowText)
+    let original = rowText
+    let streaming = false
+    if (tag !== null) {
+      await read($, fmtHeld)
+      const h = held.get(tag)
+      original = h?.final && h.text !== null ? h.text : stripTag(rowText)
+      streaming = h !== undefined && !h.final
+    }
     const orchestrator = (await read($, fmtOrch)) === true
     const { marked, text } = stripMark(original)
     const shown = marked ? text : orchestrator && endsWithPartialMark(original) ? hidePartialMark(original) : original
-    const asIs = () => (shown === original ? next(e) : next({ ...e, props: { ...e.props, text: shown } }))
+    const asIs = () => (shown === rowText ? next(e) : next({ ...e, props: { ...e.props, text: shown } }))
     if (e.surface !== 'terminal' || e.props.isSummary) return asIs()
     if ((await read($, fmtOn)) !== true || (await read($, fmtRaw)) === true) return asIs()
+    const el = $.ui.resolve(e)
+    // The original is not complete yet: the placeholder, counting from the start of the turn.
+    if (streaming) return drawPlaceholder(el, await read($, fmtFrame), (await read($, fmtTurn)).at ?? undefined)
     const key = keyOf(text)
     if ((await readMark($, key)) === true) return asIs()
     const entry = await readEntry($, key)
-    const el = $.ui.resolve(e)
     // A finished page is drawn whether or not the orchestrate skill has loaded in this session: a resumed transcript gets
     // its pages back before the skill does. Only a conversion of a new reply needs the skill.
     if (entry?.state === 'done') return drawParts(el, entry.parts)
