@@ -54,7 +54,7 @@ A reply is shown as written until its rewrite arrives, then swapped. Only the ma
 | 300 to 2000 characters (short) | 6000 tokens, 30 s | 9000 tokens, 40 s | 18000 tokens, 80 s |
 | 2001 to 5000 characters (long) | 13000 tokens, 90 s | 20000 tokens, 90 s | 38000 tokens, 150 s |
 
-Anything shorter, longer or excluded stays as written. The model and effort are the two rows; one choice serves both lengths. A rewrite is drawn only if it keeps every id, number and backticked item of the original and invents none, offers no reply the message did not offer, and is in the layout. Anything else leaves the original on screen. The **Format replies** note shows this session's counts (formatted, as written), how many replies were marked and asked for, the last outcome with its length and model (for example `last: timeout (long/opus)`), the spend (`api $0.12` or `plan $0.12`) and `paused: <reason>` while paused.
+Anything shorter, longer or excluded stays as written. The model and effort are the two rows; one choice serves both lengths. A rewrite is drawn only if it keeps every id, number and backticked item of the original and invents none, offers no reply the message did not offer, and is in the layout. Anything else leaves the original on screen. The **Format replies** note shows this session's counts (formatted, as written), how many replies were marked and asked for, the last outcome with its length and model (for example `last: timeout (long/opus)`), the spend by billing (`api $0.12`, `plan $0.12`, or both, for example `api $0.02 · plan $0.04` after you switched billing in a session) and `paused: <reason>` while paused.
 
 ### Which replies: the marker and "format that"
 

@@ -38,10 +38,10 @@ const fmtSeq = atom({ plugin: 'orch-ui', key: 'fmtSeq' } as const, 0)
 const EMPTY_ORDER: FmtOrderItem[] = []
 // The keys that received a valid entry, oldest turn first.
 const fmtOrder = atom({ plugin: 'orch-ui', key: 'fmtOrder' } as const, EMPTY_ORDER)
-const EMPTY_STATS: FmtStats = { formatted: 0, kept: 0, last: null, spentUsd: 0, billing: null, viaBaseUrl: false, eligible: 0, marked: 0, asked: 0 }
+const EMPTY_STATS: FmtStats = { formatted: 0, kept: 0, last: null, spentApiUsd: 0, spentPlanUsd: 0, billing: null, viaBaseUrl: false, eligible: 0, marked: 0, asked: 0 }
 // A stored value of another shape reads as the empty counts.
 const isStats = (s: unknown): s is FmtStats =>
-  typeof s === 'object' && s !== null && ['formatted', 'kept', 'spentUsd', 'eligible', 'marked', 'asked'].every(k => typeof (s as Record<string, unknown>)[k] === 'number')
+  typeof s === 'object' && s !== null && ['formatted', 'kept', 'spentApiUsd', 'spentPlanUsd', 'eligible', 'marked', 'asked'].every(k => typeof (s as Record<string, unknown>)[k] === 'number')
 const fmtStats = atom({ plugin: 'orch-ui', key: 'fmtStats' } as const, EMPTY_STATS)
 // The settings, also kept in $.store (loaded at session start; a stored value of another kind reads as the default).
 const fmtModel = atom({ plugin: 'orch-ui', key: 'fmtModel' } as const, DEFAULT_MODEL as string)
@@ -89,8 +89,10 @@ const enqueue = ($: EngineInterface, key: string, seq: number) =>
 
 // Records one outcome: the entry, this session's counts and spend, and the last reason. `ran` is what the call
 // reported once it got as far as a run (its billing, and whether a gateway is set); without it the last stays.
-async function record($: EngineInterface, key: string, entry: FmtEntry, seq: number, a: { r: Route; model: string; retry: boolean }, reason: string, costUsd: number, ran: CallSeen | null) {
+async function record($: EngineInterface, key: string, entry: FmtEntry, seq: number, a: { r: Route; model: string; retry: boolean; billing: Billing }, reason: string, costUsd: number, ran: CallSeen | null) {
   const ok = entry.state === 'done'
+  // The money goes to the billing that paid for this run; a call that never got as far as a run spent none.
+  const paid = ran ? ran.billing : a.billing
   if (ok) await enqueue($, key, seq)
   await changeEntry($, key, () => entry)
   await update($, fmtStats, s => {
@@ -101,7 +103,8 @@ async function record($: EngineInterface, key: string, entry: FmtEntry, seq: num
       // a second try of a reply already counted as written is not counted twice
       kept: Math.max(0, cur.kept + (ok ? 0 : 1) - (a.retry ? 1 : 0)),
       last: { reason, kind: a.r.kind, model: a.model },
-      spentUsd: cur.spentUsd + costUsd,
+      spentApiUsd: cur.spentApiUsd + (paid === 'api' ? costUsd : 0),
+      spentPlanUsd: cur.spentPlanUsd + (paid === 'api' ? 0 : costUsd),
       billing: ran ? ran.billing : cur.billing,
       viaBaseUrl: ran ? ran.viaBaseUrl : cur.viaBaseUrl,
     }
@@ -143,10 +146,10 @@ async function convert($: EngineInterface, text: string, seq: number, retry = fa
     formatCall($, req, { billing, keySource }, { seen: info => { ran = info } }))
   if (!res.ok) {
     if ((PAUSE_REASONS as readonly string[]).includes(res.reason)) await update($, fmtPause, () => res.reason)
-    await record($, key, { state: 'kept', kind: r.kind, reason: res.reason }, seq, { r, model, retry }, res.reason, res.costUsd, ran)
+    await record($, key, { state: 'kept', kind: r.kind, reason: res.reason }, seq, { r, model, retry, billing }, res.reason, res.costUsd, ran)
     return
   }
-  await record($, key, { state: 'done', kind: r.kind, parts: res.parts }, seq, { r, model, retry }, 'ok', res.costUsd, ran)
+  await record($, key, { state: 'done', kind: r.kind, parts: res.parts }, seq, { r, model, retry, billing }, 'ok', res.costUsd, ran)
 }
 
 // -- raw -------------------------------------------------------------------------------------------
@@ -308,7 +311,12 @@ export async function formatRow($: EngineInterface): Promise<{ on: boolean; note
   if (stats.formatted + stats.kept > 0) bits.push(`formatted ${stats.formatted} · as written ${stats.kept}`)
   if (stats.eligible > 0 && settingOf(await read($, fmtTrigger), TRIGGERS, DEFAULT_TRIGGER) === 'marked') bits.push(`marked ${stats.marked} of ${stats.eligible}`, `asked ${stats.asked}`)
   if (stats.last) bits.push(`last: ${stats.last.reason} (${stats.last.kind}/${stats.last.model})`)
-  if (stats.billing) bits.push(`${stats.billing === 'api' ? 'api' : 'plan'} $${stats.spentUsd.toFixed(2)}`)
+  // Each billing is drawn with its own total. Before any spend the last run's billing shows its $0.00.
+  const money: string[] = []
+  if (stats.spentApiUsd > 0) money.push(`api $${stats.spentApiUsd.toFixed(2)}`)
+  if (stats.spentPlanUsd > 0) money.push(`plan $${stats.spentPlanUsd.toFixed(2)}`)
+  if (money.length === 0 && stats.billing) money.push(`${stats.billing === 'api' ? 'api' : 'plan'} $0.00`)
+  bits.push(...money)
   if (stats.viaBaseUrl) bits.push('via ANTHROPIC_BASE_URL')
   const pause = await read($, fmtPause)
   if (pause) bits.push(`paused: ${pause}`)
