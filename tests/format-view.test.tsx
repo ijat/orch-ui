@@ -506,6 +506,17 @@ test('setting rows: the key row names the source and the last key reason, and sh
   await ui.unmount()
 })
 
+test('setting rows: no ANTHROPIC_API_KEY under API billing shows billing-mismatch as the key row\'s last reason', async ($, on) => {
+  const b = await boot($, on)
+  b.w.replies.set(options.source, { stdout: cli.stream(cli.init('none'), cli.resultNoCredential()) })
+  await orchestrate($)
+  await finish($, b, options.source)
+  const ui = await settingsPane($)
+  expect(await paneTexts(ui)).toContain('from ANTHROPIC_API_KEY · last: billing-mismatch')
+  expect((await optionRow(ui)).note).toMatch(/paused: billing-mismatch$/)
+  await ui.unmount()
+})
+
 test('setting rows: a missing key file is the last key reason', async ($, on) => {
   const b = await boot($, on, { 'opt:format': true, 'opt:format-key': 'file' })
   await convertOne($, b)
@@ -1244,7 +1255,8 @@ test('a billing mismatch pauses formatting for the session; /clear lifts it', as
 
 const PAUSE_CASES: [string, Reply, string, boolean][] = [
   ['auth failure', { stdout: cli.stream(cli.init('ANTHROPIC_API_KEY'), cli.resultApiError(401)) }, 'auth-failed', true],
-  ['no credential', { stdout: cli.stream(cli.init('ANTHROPIC_API_KEY'), cli.resultNoCredential()) }, 'no-credential', true],
+  // `--bare` with no key: the CLI reports no key source (init 'none') and a "Not logged in" error, so the billing proof fails first
+  ['no key under API billing', { stdout: cli.stream(cli.init('none'), cli.resultNoCredential()) }, 'billing-mismatch', true],
   ['a model that is not the one asked', { stdout: cli.stream(cli.init('ANTHROPIC_API_KEY'), cli.resultOk(options.output, { modelUsage: { 'claude-sonnet-5-5': {} } })) }, 'model-mismatch', true],
   ['a missing program', { deny: 'spawn claude ENOENT' }, 'cli-missing', true],
   ['a rate limit', { stdout: cli.stream(cli.init('ANTHROPIC_API_KEY'), cli.resultApiError(429)) }, 'rate-limited', false],

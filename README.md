@@ -80,7 +80,7 @@ Each rewrite is one `claude -p` child run, and the **Format billing** row says w
 
 The default needs the key. **Format API key** says where it comes from:
 
-- `ANTHROPIC_API_KEY`: the variable of the session that started `claude`. orch-ui never reads it; the child inherits it. Without it, formatting pauses with `no-credential`; set the variable before starting `claude`, or switch **Format billing** to `subscription`.
+- `ANTHROPIC_API_KEY`: the variable of the session that started `claude`. orch-ui never reads it; the child inherits it. Without it the run finds no key and formatting pauses with `billing-mismatch` (the **Format API key** row shows it as `last: billing-mismatch`); set the variable before starting `claude`, or switch **Format billing** to `subscription`.
 - `~/.claude/settings.local.json`: a key file in your home folder, read for each call and never kept. The key is the field `orchUi.formatApiKey`:
 
   ```
@@ -116,9 +116,9 @@ The first group pauses formatting for the session. The reply stays as written, n
 
 | Reason | What it means and what to do |
 | --- | --- |
-| `billing-mismatch` | The run did not use the credential the **Format billing** row asks for. Check the key (or the login) and press a row. |
+| `billing-mismatch` | The run did not use the credential the **Format billing** row asks for. With `API key` billing this is also what a missing key looks like: no `ANTHROPIC_API_KEY` reached the run (or the key file gave none). Set the variable before starting `claude`, or switch **Format billing** to `subscription`, then press a row. With `subscription`, check your claude.ai login. |
 | `model-mismatch` | The run answered with another model than the **Format model** row. Press a row; pick another model if it repeats. |
-| `no-credential` | API billing and no key reached the run. Set `ANTHROPIC_API_KEY` before starting `claude`, or switch **Format billing** to `subscription`. |
+| `no-credential` | An API run that did use a key ended with an error, with no output and no cost, and no API status. Check the key, then press a row. |
 | `auth-failed` | The API refused the key (401 or 403). Replace the key. |
 | `cli-missing` | The `claude` command was not found. Put it on `PATH`. |
 | `cloud-provider` | A Bedrock, Vertex, Foundry or similar provider variable is set. Formatting uses Anthropic's own API only; unset it for this plugin to work. |

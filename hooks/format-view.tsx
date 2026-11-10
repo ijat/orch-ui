@@ -340,7 +340,8 @@ export type SettingRow = { id: SettingId; key: string; label: string; value: str
 
 const KEY_FILE_LABEL = '~/.claude/settings.local.json'
 // The last outcomes that say something about the credential, for the key row's note.
-const KEY_REASONS: readonly string[] = ['no-credential', 'auth-failed', 'base-url-set', 'key-file-missing', 'key-file-unsafe', 'key-file-invalid']
+// An api run that finds no key reports no key source, which verifyRun maps to billing-mismatch, so it is listed first.
+const KEY_REASONS: readonly string[] = ['billing-mismatch', 'no-credential', 'auth-failed', 'base-url-set', 'key-file-missing', 'key-file-unsafe', 'key-file-invalid']
 
 async function settingsNow($: EngineInterface) {
   return {
