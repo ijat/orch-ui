@@ -45,7 +45,7 @@ A setting applies from the next call. Pressing any of the five setting rows also
 
 ## Format replies
 
-In a session where the `orchestrate` skill has loaded, orch-ui redraws the agent's finished replies in a fixed layout: a colored banner with the point of the message, a titled section for what you must do, at most one bordered panel for what blocks you, sections for the rest, and the replies you can type last. Identifiers (paths, branches, commits, versions, issues, ids, URLs, commands) are drawn as small colored pills. It is a redraw only: the stored transcript never changes, and any other session is left alone, with no model call, no tool and no row changed. Terminal only.
+In a session where the `orchestrate` skill has loaded, orch-ui redraws the agent's finished replies in a fixed layout: a colored banner with the point of the message, a titled section for what you must do, at most one bordered panel for what blocks you, sections for the rest, and the replies you can type last. Identifiers (paths, branches, commits, versions, issues, ids, URLs, commands) are drawn as small colored pills. It is a redraw only: the stored transcript never changes, and any other session is left alone, with no model call and no tool (a page saved earlier is still redrawn, see **Resume**). Terminal only.
 
 A reply that is not marked (see below) is shown as written until its rewrite arrives, then swapped. A marked reply is never shown as plain text first: from its first streamed characters until the rewrite is ready it is drawn as a rounded page with one animated line (`⠹ formatting reply · 3s`, the spinner and the seconds since the work began). If the rewrite fails, or formatting is paused, the page gives way to the original text (the marker removed) with one dim line under it, `orch-ui: shown as written (<reason>)`; a reply shown raw, or with the option off, is the original text with no line. A marked reply from an earlier turn that never got a rewrite (an old transcript) is drawn as written, not as the placeholder. Only the main agent's replies are rewritten, and only when they have no code fence, no table and no banner already.
 
@@ -55,6 +55,10 @@ A reply that is not marked (see below) is shown as written until its rewrite arr
 | 2001 to 5000 characters (long) | 13000 tokens, 90 s | 20000 tokens, 90 s | 38000 tokens, 150 s |
 
 Anything shorter, longer or excluded stays as written. The model and effort are the two rows; one choice serves both lengths. A rewrite is drawn only if it keeps every id, number and backticked item of the original and invents none, offers no reply the message did not offer, and is in the layout. Anything else leaves the original on screen. The **Format replies** note shows this session's counts (formatted, as written), how many replies were marked and asked for, the last outcome with its length and model (for example `last: timeout (long/opus)`), the spend by billing (`api $0.12`, `plan $0.12`, or both, for example `api $0.02 · plan $0.04` after you switched billing in a session) and `paused: <reason>` while paused.
+
+### Resume: finished pages come back
+
+A page that was formatted successfully is saved in orch-ui's own store (`fmt:<key>` per reply, plus an index), so a resumed session draws it again at once, with no model call. This works whether or not the `orchestrate` skill has loaded yet; converting a new reply still needs the skill. Only finished pages are saved (a failure is not), at most 200 pages and 1 MiB of JSON in all, oldest dropped first. A saved value of another shape or version is ignored and cleaned up at the next save. `/clear` does not delete saved pages, and with **Format replies** off nothing is drawn from them. The saved text is the model's rewrite of your reply, kept locally in the plugin's store file under your Claude Code configuration directory.
 
 ### Which replies: the marker and "format that"
 

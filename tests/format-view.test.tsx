@@ -3,12 +3,13 @@ import type { On } from 'claude-code'
 import type { Engine, MockClock } from 'claude-code/testing'
 
 import { FORMAT_SYSTEM, KINDS, LIMITS, MARK } from '../hooks/format'
-import { FORMAT_TOOL, FORMAT_TOOL_FULL, FRAMES, PILL_LEFT, PILL_RIGHT } from '../hooks/format-view'
+import { FMT_MAX_BYTES, FMT_MAX_ENTRIES, FORMAT_TOOL, FORMAT_TOOL_FULL, FRAMES, PILL_LEFT, PILL_RIGHT } from '../hooks/format-view'
 import * as cli from './fixtures/format/cli'
 import * as done from './fixtures/format/done'
 import * as long from './fixtures/format/long'
 import * as options from './fixtures/format/options'
 import * as review from './fixtures/format/review'
+import { textKey } from '../hooks/lib'
 
 type Call = {
   model: string; effort?: string; maxTokens?: number; timeoutMs?: number; system?: string; prompt: string
@@ -41,6 +42,8 @@ type World = {
   engineRows: string[]
   // the description of each tool registered
   descriptions: string[]
+  // every store call as `op:key` (keys has none), and a switch that makes the writes under `fmt:` fail
+  storeOps: string[]; denyFmtWrites: boolean; denyFmtReads: boolean
 }
 
 const CLAUDE_BIN = 'claude'
@@ -56,7 +59,7 @@ async function boot($: Engine, on: On, seed: Record<string, unknown> = { 'opt:fo
   const mc = mock.clock(on, { now: Date.parse('2026-11-10T10:00Z') })
   const w: World = {
     calls: [], tools: [], commands: [], opened: [], store: new Map(Object.entries({ 'opt:format-trigger': 'auto', ...seed })), replies: new Map(), delays: new Map(),
-    env: { ...envVars }, envAsked: [], files: new Map(), stats: [], reads: [], written: [], runs: [], logs: [], cost: 0.0061, lsExit: 0, aclExit: 0, truncated: false, advancing: 0, periods: 0, engineRows: [], descriptions: [],
+    env: { ...envVars }, envAsked: [], files: new Map(), stats: [], reads: [], written: [], runs: [], logs: [], cost: 0.0061, lsExit: 0, aclExit: 0, truncated: false, advancing: 0, periods: 0, engineRows: [], descriptions: [], storeOps: [], denyFmtWrites: false, denyFmtReads: false,
   }
   // A fake run that lasts N ms moves the clock N ms from inside its hook. The animation timer ticks every 100 ms on the
   // way, and the mock clock resolves them one at a time as the test's own calls come, so settle and advance go on until such a run is over.
@@ -181,16 +184,27 @@ async function boot($: Engine, on: On, seed: Record<string, unknown> = { 'opt:fo
     w.descriptions.push(e.description)
     return { value: { tool: `mcp__orch-ui__${e.name}` } }
   })
-  on('store.get', (_, e) => ({ value: w.store.get(e.key) }))
+  on('store.get', (_, e) => {
+    w.storeOps.push(`get:${e.key}`)
+    if (w.denyFmtReads && e.key.startsWith('fmt:')) return { deny: 'store is unreadable' }
+    return { value: w.store.get(e.key) }
+  })
   on('store.set', (_, e) => {
-    w.store.set(e.key, e.value)
+    w.storeOps.push(`set:${e.key}`)
+    if (w.denyFmtWrites && e.key.startsWith('fmt:')) return { deny: 'store is full' }
+    // the store holds JSON: what is read back is a copy
+    w.store.set(e.key, JSON.parse(JSON.stringify(e.value)))
     return { value: undefined }
   })
   on('store.delete', (_, e) => {
+    w.storeOps.push(`delete:${e.key}`)
     w.store.delete(e.key)
     return { value: undefined }
   })
-  on('store.keys', () => ({ value: [...w.store.keys()] }))
+  on('store.keys', () => {
+    w.storeOps.push('keys')
+    return { value: [...w.store.keys()] }
+  })
   await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
   await clock.settle()
   return { clock, w }
@@ -715,9 +729,9 @@ test('/clear forgets the marking, the raw state and the list; the option stays',
   await callTool($, { format: 'raw' })
   await callTool($, { format: 'raw', scope: 'session' })
   await $.session.end({ reason: 'clear', sessionId: 's1', resume: {} } as never)
-  // No longer an orchestrator session: every row is the engine's.
-  expect(await isOriginal(first)).toBe(true)
-  expect(await isOriginal(second)).toBe(true)
+  // No longer an orchestrator session: nothing new is converted. A finished page still draws (it is a saved page; D7).
+  expect(await isOriginal(first)).toBe(false)
+  expect(await isOriginal(second)).toBe(false)
   b.w.replies.set(review.source, review.output)
   await finish($, b, review.source)
   expect(b.w.calls).toHaveLength(2)
@@ -2028,5 +2042,254 @@ test('with the option off or switched off, a turn runs no timer and marked rows 
   expect(await quiet(b, 1000)).toBe(0)
   const ui = await show($, MARK)
   expect(await isOriginal(ui)).toBe(true)
+  await ui.unmount()
+})
+
+// -- the saved outcomes: persisted `done` pages, drawn again on resume ----------------------------------------------
+
+const saved = (source: string) => `fmt:${textKey(source.trim())}`
+const SEEDED = (title: string) => ({ v: 1, state: 'done', kind: 'short', parts: [{ kind: 'banner', tag: 'info', title }] })
+const fmtKeys = (b: Booted) => [...b.w.store.keys()].filter(k => k.startsWith('fmt:'))
+const indexOf = (b: Booted) => (b.w.store.get('fmt:index') as { v: number; items: { k: string; n: number }[] } | undefined)
+const tk = (n: number) => `p1-${n.toString(16).padStart(14, '0')}`
+// A store seeded with `count` valid pages, oldest first, and the index that lists them. Each page has `pad` characters of body.
+function seedPages(count: number, pad = 0, from = 0) {
+  const seed: Record<string, unknown> = {}
+  const items: { k: string; n: number }[] = []
+  for (let i = from; i < from + count; i++) {
+    const value = { v: 1, state: 'done', kind: 'short', parts: [{ kind: 'plain', body: `page ${i}${'x'.repeat(pad)}` }] }
+    seed[`fmt:${tk(i)}`] = value
+    items.push({ k: tk(i), n: JSON.stringify(value).length })
+  }
+  seed['fmt:index'] = { v: 1, items }
+  return seed
+}
+
+test('a done conversion is saved under fmt:<key> and listed in fmt:index; a failed one is not', async ($, on) => {
+  const b = await boot($, on)
+  b.w.replies.set(options.source, options.output)
+  await orchestrate($)
+  await finish($, b, options.source)
+  expect(fmtKeys(b).sort()).toEqual([saved(options.source), 'fmt:index'].sort())
+  const value = b.w.store.get(saved(options.source)) as { v: number; state: string; kind: string; parts: unknown[] }
+  expect(value).toMatchObject({ v: 1, state: 'done', kind: 'short' })
+  expect(value.parts.length).toBeGreaterThan(0)
+  expect(indexOf(b)).toEqual({ v: 1, items: [{ k: textKey(options.source.trim()), n: JSON.stringify(value).length }] })
+  // a reply the model does not rewrite is as written and leaves no trace
+  b.w.replies.set(done.source, 'not a rewrite')
+  await finish($, b, done.source)
+  expect(b.w.calls).toHaveLength(2)
+  expect(fmtKeys(b)).toHaveLength(2)
+  // the same text again is not saved again
+  const before = b.w.storeOps.length
+  await finish($, b, options.source)
+  expect(b.w.calls).toHaveLength(2)
+  expect(b.w.storeOps.slice(before).filter(o => o.startsWith('set:'))).toEqual([])
+})
+
+test('a new session with a saved page draws it with no model call and without the skill', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true, [saved(INFO_SOURCE)]: SEEDED('Seeded title'), 'fmt:index': { v: 1, items: [{ k: textKey(INFO_SOURCE.trim()), n: 80 }] } })
+  const ui = await show($, INFO_SOURCE)
+  expect(await isOriginal(ui)).toBe(false)
+  expect(await texts(ui)).toEqual([' Seeded title '])
+  // a marked copy of the same reply draws the same page; another text is untouched
+  const mk = await show($, `${MARK}\n\n${INFO_SOURCE}`)
+  expect(await texts(mk)).toEqual([' Seeded title '])
+  const other = await show($, done.source)
+  expect(await isOriginal(other)).toBe(true)
+  expect(b.w.calls).toEqual([])
+  expect(b.w.tools).not.toContain(FORMAT_TOOL)
+  await ui.unmount()
+  await mk.unmount()
+  await other.unmount()
+})
+
+test('the load costs one index read and one read per saved page, and drawing reads no store', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true, ...seedPages(3) })
+  const loads = b.w.storeOps.filter(o => o.startsWith('get:fmt:'))
+  expect(loads).toEqual(['get:fmt:index', ...[0, 1, 2].map(i => `get:fmt:${tk(i)}`)])
+  expect(b.w.storeOps).not.toContain('keys')
+  const before = b.w.storeOps.length
+  const ui = await show($, INFO_SOURCE)
+  const again = await show($, done.source)
+  expect(b.w.storeOps.length).toBe(before)
+  await ui.unmount()
+  await again.unmount()
+})
+
+test('with the option off nothing is drawn from the saved pages', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': false, [saved(INFO_SOURCE)]: SEEDED('Seeded title'), 'fmt:index': { v: 1, items: [{ k: textKey(INFO_SOURCE.trim()), n: 80 }] } })
+  const ui = await show($, INFO_SOURCE)
+  expect(await isOriginal(ui)).toBe(true)
+  await orchestrate($)
+  expect(await isOriginal(ui)).toBe(true)
+  // switching it on in settings brings the page back: the entries were loaded
+  const pane = await settingsPane($)
+  await pane.press({ key: 'opt-format' })
+  await b.clock.settle()
+  expect(await isOriginal(ui)).toBe(false)
+  expect(await texts(ui)).toEqual([' Seeded title '])
+  await pane.unmount()
+  await ui.unmount()
+})
+
+test('a saved page of a reply shown raw is drawn as written, as for any page', async ($, on) => {
+  const b = await boot($, on)
+  b.w.replies.set(options.source, options.output)
+  await orchestrate($)
+  await finish($, b, options.source)
+  const ui = await show($, options.source)
+  expect(await isOriginal(ui)).toBe(false)
+  await callTool($, { format: 'raw', scope: 'session' })
+  await b.clock.settle()
+  expect(await isOriginal(ui)).toBe(true)
+  await ui.unmount()
+})
+
+test('/clear leaves the saved pages in the store', async ($, on) => {
+  const b = await boot($, on)
+  b.w.replies.set(options.source, options.output)
+  await orchestrate($)
+  await finish($, b, options.source)
+  const before = JSON.stringify([...b.w.store.entries()].filter(([k]) => k.startsWith('fmt:')))
+  await $.session.end({ reason: 'clear', sessionId: 's1' } as never)
+  await b.clock.settle()
+  expect(JSON.stringify([...b.w.store.entries()].filter(([k]) => k.startsWith('fmt:')))).toBe(before)
+  expect(b.w.storeOps.filter(o => o.startsWith('delete:'))).toEqual([])
+})
+
+test(`eviction by count: past ${FMT_MAX_ENTRIES} pages the oldest go first and the newest is kept`, async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true, ...seedPages(FMT_MAX_ENTRIES) })
+  expect(indexOf(b)!.items).toHaveLength(FMT_MAX_ENTRIES)
+  b.w.replies.set(options.source, options.output)
+  await orchestrate($)
+  await finish($, b, options.source)
+  const items = indexOf(b)!.items
+  expect(items).toHaveLength(FMT_MAX_ENTRIES)
+  expect(items[0]!.k).toBe(tk(1))
+  expect(items[items.length - 1]!.k).toBe(textKey(options.source.trim()))
+  expect(b.w.store.has(`fmt:${tk(0)}`)).toBe(false)
+  expect(b.w.store.has(`fmt:${tk(1)}`)).toBe(true)
+  expect(fmtKeys(b)).toHaveLength(FMT_MAX_ENTRIES + 1)
+  // a second one evicts the next oldest
+  b.w.replies.set(done.source, done.output)
+  await finish($, b, done.source)
+  expect(indexOf(b)!.items[0]!.k).toBe(tk(2))
+  expect(fmtKeys(b)).toHaveLength(FMT_MAX_ENTRIES + 1)
+})
+
+test('eviction by size: past 1 MiB of JSON the oldest go first until the rest fits', async ($, on) => {
+  // four pages of about 400 KB: only two fit with the new page
+  const b = await boot($, on, { 'opt:format': true, ...seedPages(4, 400_000) })
+  const total = indexOf(b)!.items.reduce((s, it) => s + it.n, 0)
+  expect(total).toBeGreaterThan(FMT_MAX_BYTES)
+  b.w.replies.set(options.source, options.output)
+  await orchestrate($)
+  await finish($, b, options.source)
+  const items = indexOf(b)!.items
+  expect(items.reduce((s, it) => s + it.n, 0)).toBeLessThanOrEqual(FMT_MAX_BYTES)
+  expect(items.map(it => it.k)).toEqual([tk(2), tk(3), textKey(options.source.trim())])
+  expect(b.w.store.has(`fmt:${tk(0)}`)).toBe(false)
+  expect(b.w.store.has(`fmt:${tk(1)}`)).toBe(false)
+  // the sizes in the index are the sizes of what is stored
+  for (const it of items) expect(JSON.stringify(b.w.store.get(`fmt:${it.k}`)).length).toBe(it.n)
+  // the stored JSON under the prefix stays within the allowance
+  const all = fmtKeys(b).filter(k => k !== 'fmt:index').reduce((s, k) => s + JSON.stringify(b.w.store.get(k)).length, 0)
+  expect(all).toBeLessThanOrEqual(FMT_MAX_BYTES)
+})
+
+test('a stored value of another shape or version is ignored, then deleted by the next save', async ($, on) => {
+  const goodKey = textKey(INFO_SOURCE.trim())
+  const rows = [options, done, long, review].map(f => textKey(f.source.trim()))
+  const seed = {
+    'opt:format': true,
+    [`fmt:${goodKey}`]: SEEDED('Good title'),
+    [`fmt:${rows[0]}`]: { ...SEEDED('v2'), v: 2 },
+    [`fmt:${rows[1]}`]: { v: 1, state: 'kept', kind: 'short', reason: 'timeout' },
+    [`fmt:${rows[2]}`]: { v: 1, state: 'done', kind: 'short', parts: [{ kind: 'banner', tag: 'nope', title: 'x' }] },
+    // listed in the index but gone from the store
+    // (rows[3] has no entry); and one key under the prefix that the index does not list
+    'fmt:p1-00000000000abc': SEEDED('stray'),
+    'fmt:index': { v: 1, items: [goodKey, ...rows].map(k => ({ k, n: 100 })) },
+  }
+  const b = await boot($, on, seed)
+  const good = await show($, INFO_SOURCE)
+  expect(await texts(good)).toEqual([' Good title '])
+  for (const f of [options, done, long, review]) {
+    const ui = await show($, f.source)
+    expect(await isOriginal(ui)).toBe(true)
+    await ui.unmount()
+  }
+  // the bad values stay in the store until a save
+  expect(b.w.storeOps.filter(o => o.startsWith('delete:'))).toEqual([])
+  expect(fmtKeys(b)).toHaveLength(6)
+  b.w.replies.set(options.source, options.output)
+  await orchestrate($)
+  await finish($, b, options.source)
+  expect(fmtKeys(b).sort()).toEqual(['fmt:index', `fmt:${goodKey}`, saved(options.source)].sort())
+  expect(indexOf(b)!.items.map(it => it.k)).toEqual([goodKey, textKey(options.source.trim())])
+  await good.unmount()
+})
+
+const BAD_INDEXES: [string, unknown][] = [
+  ['text', 'not an index'],
+  ['another version', { v: 2, items: [{ k: textKey(INFO_SOURCE.trim()), n: 1 }] }],
+  ['items not a list', { v: 1, items: 'x' }],
+  ['items that are not text keys', { v: 1, items: [{ k: 'opt:format', n: 1 }, { k: '../x', n: 1 }, { k: textKey(INFO_SOURCE.trim()) }] }],
+]
+for (const [name, bad] of BAD_INDEXES) {
+  test(`a bad index (${name}) is ignored: nothing is loaded from it and the next save replaces it`, async ($, on) => {
+    const key = textKey(INFO_SOURCE.trim())
+    const b = await boot($, on, { 'opt:format': true, [`fmt:${key}`]: SEEDED('lost'), 'fmt:index': bad })
+    const ui = await show($, INFO_SOURCE)
+    expect(await isOriginal(ui)).toBe(true)
+    // the load read only the index, and never a key outside the prefix
+    expect(b.w.storeOps.filter(o => o.startsWith('get:fmt:'))).toEqual(['get:fmt:index'])
+    expect(b.w.store.get('opt:format')).toBe(true)
+    b.w.replies.set(options.source, options.output)
+    await orchestrate($)
+    await finish($, b, options.source)
+    expect(fmtKeys(b).sort()).toEqual(['fmt:index', saved(options.source)].sort())
+    expect(indexOf(b)!.items.map(it => it.k)).toEqual([textKey(options.source.trim())])
+    expect(b.w.store.get('opt:format')).toBe(true)
+    await ui.unmount()
+  })
+}
+
+test('a store that refuses the writes never fails the conversion: the page is drawn and the session goes on', async ($, on) => {
+  const b = await boot($, on)
+  b.w.denyFmtWrites = true
+  b.w.replies.set(options.source, options.output)
+  b.w.replies.set(done.source, done.output)
+  await orchestrate($)
+  const ui = await show($, options.source)
+  await finish($, b, options.source)
+  expect(await isOriginal(ui)).toBe(false)
+  expect(fmtKeys(b)).toEqual([])
+  // later saves still work once the store does
+  b.w.denyFmtWrites = false
+  await finish($, b, done.source)
+  expect(fmtKeys(b).sort()).toEqual(['fmt:index', saved(done.source)].sort())
+  expect(await quiet(b, 1000)).toBe(0)
+  await ui.unmount()
+})
+
+test('a store that cannot be read leaves the replies as written and the option still works', async ($, on) => {
+  const b = await boot($, on, { 'opt:format': true })
+  // a /clear resets the session; the next skill load reads the store again, now unreadable under fmt:
+  b.w.store.set(saved(INFO_SOURCE), SEEDED('Seeded title'))
+  b.w.store.set('fmt:index', { v: 1, items: [{ k: textKey(INFO_SOURCE.trim()), n: 80 }] })
+  b.w.denyFmtReads = true
+  await $.session.end({ reason: 'clear', sessionId: 's1' } as never)
+  await orchestrate($)
+  await b.clock.settle()
+  const ui = await show($, INFO_SOURCE)
+  expect(await isOriginal(ui)).toBe(true)
+  // readable again: the next load (after another /clear) brings the page back
+  b.w.denyFmtReads = false
+  await $.session.end({ reason: 'clear', sessionId: 's1' } as never)
+  await orchestrate($)
+  await b.clock.settle()
+  expect(await isOriginal(ui)).toBe(false)
   await ui.unmount()
 })

@@ -26,7 +26,8 @@ const OPT_KEY_SOURCE = 'opt:format-key'
 const OPT_TRIGGER = 'opt:format-trigger'
 
 // -- state -----------------------------------------------------------------------------------------
-// The option (also kept in $.store) and what one session knows. Nothing but the option outlives the session.
+// The option (also kept in $.store) and what one session knows. Only the option, the settings and the `done` pages (see
+// the saved outcomes, below) outlive the session.
 
 const fmtOn = atom({ plugin: 'orch-ui', key: 'fmtOn' } as const, false)
 // True once the orchestrate skill has loaded in this session; /clear resets it.
@@ -104,6 +105,7 @@ async function record($: EngineInterface, key: string, entry: FmtEntry, seq: num
   const paid = paidBy ?? (ran ? ran.billing : a.billing)
   if (ok) await enqueue($, key, seq)
   await changeEntry($, key, () => entry)
+  saveDone($, key, entry)
   await update($, fmtStats, s => {
     const cur = isStats(s) ? s : EMPTY_STATS
     return {
@@ -251,6 +253,125 @@ async function convert($: EngineInterface, text: string, seq: number, retry = fa
   }
 }
 
+// -- the saved outcomes (D6, D7) ---------------------------------------------------------------------
+// A formatted page is saved in $.store when its conversion ends `done`, so a resumed session draws it again with no model
+// call. One key per reply (`fmt:<text key>`) and an index (`fmt:index`) that lists the keys oldest first, with the size of
+// each; the oldest go first when there are more than 200 or more than 1 MiB of JSON in all. Only `done` is saved. Every
+// store error is swallowed: a save never blocks or fails a conversion, and a load that fails leaves the replies as written.
+
+const FMT_PREFIX = 'fmt:'
+const FMT_INDEX = 'fmt:index'
+const FMT_VERSION = 1
+export const FMT_MAX_ENTRIES = 200
+export const FMT_MAX_BYTES = 1024 * 1024
+const TEXT_KEY = /^p1-[0-9a-f]{14}$/
+
+type IndexItem = { k: string; n: number }
+
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+const isStr = (v: unknown): v is string => typeof v === 'string'
+const oneOf = (v: unknown, all: readonly string[]) => isStr(v) && all.includes(v)
+
+function isRow(r: unknown): boolean {
+  return isObj(r) && oneOf(r.tag, ['error', 'warn', 'note', 'good']) && isStr(r.title) && Array.isArray(r.detail) && r.detail.every(isStr)
+}
+// A stored part is drawn as is, so one of another shape must not get that far.
+function isPart(p: unknown): p is Part {
+  if (!isObj(p)) return false
+  switch (p.kind) {
+    case 'banner': return oneOf(p.tag, ['act', 'ok', 'info']) && isStr(p.title)
+    case 'plain': return isStr(p.body)
+    case 'section': return oneOf(p.tag, ['do', 'more', 'ask']) && isStr(p.title) && isStr(p.body)
+    case 'card': return isStr(p.title) && Array.isArray(p.rows) && p.rows.every(isRow)
+    default: return false
+  }
+}
+
+// The saved value of one `done` entry, or null for anything else (another version, state or shape).
+function savedEntry(v: unknown): Extract<FmtEntry, { state: 'done' }> | null {
+  if (!isObj(v) || v.v !== FMT_VERSION || v.state !== 'done' || !oneOf(v.kind, ['short', 'long'])) return null
+  if (!Array.isArray(v.parts) || !v.parts.every(isPart)) return null
+  return { state: 'done', kind: v.kind as RouteKind, parts: v.parts }
+}
+
+// The index, oldest first; a value of another shape or version reads as empty, and an item that is not a text key is dropped.
+function readIndex(v: unknown): IndexItem[] {
+  if (!isObj(v) || v.v !== FMT_VERSION || !Array.isArray(v.items)) return []
+  const out: IndexItem[] = []
+  for (const it of v.items) {
+    if (isObj(it) && isStr(it.k) && TEXT_KEY.test(it.k) && typeof it.n === 'number' && Number.isFinite(it.n) && it.n >= 0 && !out.some(x => x.k === it.k)) out.push({ k: it.k, n: it.n })
+  }
+  return out
+}
+
+const sizeOf = (json: string) => (typeof TextEncoder === 'function' ? new TextEncoder().encode(json).length : json.length)
+
+// Keys the last load found missing or of another shape: the next save drops them from the index and deletes them.
+const badKeys = new Set<string>()
+// Saves go one after the other, so two conversions that end together do not write over each other's index.
+let saving: Promise<unknown> = Promise.resolve()
+
+async function saveNow($: EngineInterface, key: string, entry: Extract<FmtEntry, { state: 'done' }>) {
+  const value = { v: FMT_VERSION, state: 'done', kind: entry.kind, parts: entry.parts }
+  const n = sizeOf(JSON.stringify(value))
+  // One page larger than the whole allowance is not saved.
+  if (n > FMT_MAX_BYTES) return
+  const bad = new Set(badKeys)
+  badKeys.clear()
+  const items = readIndex(await $.store.get(FMT_INDEX)).filter(it => it.k !== key && !bad.has(it.k))
+  items.push({ k: key, n })
+  const drop = new Set(bad)
+  let bytes = items.reduce((sum, it) => sum + it.n, 0)
+  while (items.length > 1 && (items.length > FMT_MAX_ENTRIES || bytes > FMT_MAX_BYTES)) {
+    const old = items.shift() as IndexItem
+    bytes -= old.n
+    drop.add(old.k)
+  }
+  await $.store.set(FMT_PREFIX + key, value)
+  await $.store.set(FMT_INDEX, { v: FMT_VERSION, items })
+  const keep = new Set(items.map(it => FMT_PREFIX + it.k))
+  keep.add(FMT_INDEX)
+  // Everything under the prefix that the index does not list goes: what was evicted, what was found bad, what a failed save left.
+  const stray = new Set([...drop].map(k => FMT_PREFIX + k))
+  for (const k of await $.store.keys()) if (k.startsWith(FMT_PREFIX) && !keep.has(k)) stray.add(k)
+  for (const k of stray) {
+    if (keep.has(k)) continue
+    try {
+      await $.store.delete(k)
+    } catch {
+      // It goes on the next save.
+    }
+  }
+}
+
+function saveDone($: EngineInterface, key: string, entry: FmtEntry) {
+  if (entry.state !== 'done') return
+  saving = saving.then(() => saveNow($, key, entry)).catch(() => undefined)
+}
+
+// Loads the saved pages into this session's entries: one read of the index and one per entry, nothing else. An entry the
+// session holds already (a conversion that ended first) stays.
+async function loadSaved($: EngineInterface) {
+  let items: IndexItem[]
+  try {
+    items = readIndex(await $.store.get(FMT_INDEX))
+  } catch {
+    return
+  }
+  for (const it of items) {
+    try {
+      const entry = savedEntry(await $.store.get(FMT_PREFIX + it.k))
+      if (!entry) {
+        badKeys.add(it.k)
+        continue
+      }
+      await changeEntry($, it.k, cur => cur ?? entry)
+    } catch {
+      // This one stays as written.
+    }
+  }
+}
+
 // -- raw -------------------------------------------------------------------------------------------
 
 async function markedKeys($: EngineInterface): Promise<string[]> {
@@ -388,6 +509,7 @@ export async function loadFormat($: EngineInterface) {
   await load(OPT_BILLING, BILLINGS, DEFAULT_BILLING, v => update($, fmtBilling, () => v))
   await load(OPT_KEY_SOURCE, KEY_SOURCES, DEFAULT_KEY_SOURCE, v => update($, fmtKey, () => v))
   await load(OPT_TRIGGER, TRIGGERS, DEFAULT_TRIGGER, v => update($, fmtTrigger, () => v))
+  await loadSaved($)
 }
 
 // Every hook that reads or writes a setting, and comes before any use after a /clear, calls this first: the atoms
@@ -792,12 +914,15 @@ export function registerFormat(on: On) {
     const shown = marked ? text : orchestrator && endsWithPartialMark(original) ? hidePartialMark(original) : original
     const asIs = () => (shown === original ? next(e) : next({ ...e, props: { ...e.props, text: shown } }))
     if (e.surface !== 'terminal' || e.props.isSummary) return asIs()
-    if (!orchestrator || (await read($, fmtOn)) !== true || (await read($, fmtRaw)) === true) return asIs()
+    if ((await read($, fmtOn)) !== true || (await read($, fmtRaw)) === true) return asIs()
     const key = keyOf(text)
     if ((await readMark($, key)) === true) return asIs()
     const entry = await readEntry($, key)
     const el = $.ui.resolve(e)
+    // A finished page is drawn whether or not the orchestrate skill has loaded in this session: a resumed transcript gets
+    // its pages back before the skill does. Only a conversion of a new reply needs the skill.
     if (entry?.state === 'done') return drawParts(el, entry.parts)
+    if (!orchestrator) return asIs()
     // Only a marked reply (or the first characters of one) gets the placeholder and the reason line; any other is as written.
     if (!marked && !startsWithPartialMark(original)) return asIs()
     // The original text, and one dim line saying why it is not formatted.
